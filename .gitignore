@@ -1,0 +1,54 @@
+# ==========================================
+# Embedded Debug Tools Monorepo .gitignore
+# ==========================================
+
+# Build & Compilation Artifacts
+**/target/
+**/build/
+**/out/
+**/dist/
+**/release/
+bin/*.exe
+bin/*.pdb
+bin/*.dll
+bin/*.so
+bin/*.dylib
+
+# Gradle Cache & Settings
+**/.gradle/
+**/gradle-app.setting
+!**/gradle/wrapper/gradle-wrapper.jar
+!**/gradle/wrapper/gradle-wrapper.properties
+
+# JetBrains IntelliJ IDEA & CLion
+**/.idea/
+**/.intellijPlatform/
+**/.kotlin/
+**/*.iws
+**/*.iml
+**/*.ipr
+**/cmake-build-*/
+**/.codegraph/
+
+# Logs & Temporary Files
+**/*.log
+**/logs/
+**/tmp/
+**/temp/
+**/*.tmp
+**/stdout.txt
+**/stderr.txt
+
+# Rust / Cargo Temporary Files
+**/*.rs.bk
+Cargo.lock.bak
+
+# Operating System Files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Archives
+*.zip
+*.tar.gz
+*.7z

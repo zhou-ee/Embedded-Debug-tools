@@ -1,0 +1,53 @@
+<idea-plugin>
+    <id>org.embedded.monitor</id>
+    <name>Embedded Monitor</name>
+    <vendor>embedded-tools</vendor>
+    <description><![CDATA[
+        <p>Embedded Monitor adds real-time variable watch and an oscilloscope to CLion on top of
+        its native embedded debugger: breakpoints, stepping, core/peripheral registers and SVD
+        views stay in CLion, while this plugin reads target memory without halting the CPU.</p>
+        <p>为 CLion 附加嵌入式实时监视与示波器能力：断点调试、寄存器查看等沿用
+        CLion 原生调试器，本插件通过 embedded-clion-agent（probe-rs / OpenOCD Tcl RPC）
+        在目标运行中读取内存，提供：</p>
+        <ul>
+            <li><b>实时变量监视</b>：全局/静态变量、结构体成员链（a.b.c）、裸地址，5Hz 运行中刷新</li>
+            <li><b>寄存器实时监视</b>：CMSIS-SVD 外设与寄存器树形浏览，可选刷新频率（1Hz~10Hz）与按寄存器独立动态刷新，支持位域提取</li>
+            <li><b>示波器</b>：变量高频采样（probe-rs 最高 1kHz / OpenOCD ~870Hz）、缩放/游标/CSV 导出</li>
+            <li><b>符号表自动加载</b>：自动从 CLion 配置的构建路径（CMake File API / 构建目录）解析 ELF</li>
+        </ul>
+    ]]></description>
+
+    <depends>com.intellij.modules.platform</depends>
+
+    <extensions defaultExtensionNs="com.intellij">
+        <toolWindow id="EmbeddedLiveWatch" anchor="right" factoryClass="org.embedded.monitor.watch.LiveWatchToolWindowFactory"
+                    icon="AllIcons.Debugger.Watch"/>
+        <toolWindow id="EmbeddedRegisters" anchor="right" factoryClass="org.embedded.monitor.registers.RegisterToolWindowFactory"
+                    icon="AllIcons.Debugger.VariablesTab"/>
+        <toolWindow id="EmbeddedScope" anchor="bottom" factoryClass="org.embedded.monitor.scope.ScopeToolWindowFactory"
+                    icon="AllIcons.Toolwindows.ToolWindowPalette"/>
+        <projectService serviceImplementation="org.embedded.monitor.agent.AgentService"/>
+        <projectService serviceImplementation="org.embedded.monitor.settings.EmbeddedMonitorSettings"/>
+        <projectConfigurable parentId="tools" instance="org.embedded.monitor.settings.EmbeddedMonitorConfigurable"
+                             id="org.embedded.monitor.settings" displayName="Embedded Monitor"
+                             nonDefaultProject="true"/>
+        <notificationGroup id="Embedded Monitor" displayType="BALLOON"/>
+        <postStartupActivity implementation="org.embedded.monitor.startup.EmbeddedMonitorStartupActivity"/>
+        <statusBarWidgetFactory id="EmbeddedMonitorWidget"
+                                implementation="org.embedded.monitor.status.EmbeddedMonitorWidgetFactory"/>
+    </extensions>
+
+    <actions>
+        <group id="EmbeddedMonitor.AddGroup" text="Embedded Monitor" description="添加到实时变量监视/示波器" popup="true">
+            <add-to-group group-id="EditorPopupMenu" anchor="first"/>
+            <action id="EmbeddedMonitor.AddToWatch"
+                    class="org.embedded.monitor.actions.AddToLiveWatchAction"
+                    text="添加到实时变量监视"
+                    description="将光标处的全局/静态变量或成员链加入实时变量监视"/>
+            <action id="EmbeddedMonitor.AddToScope"
+                    class="org.embedded.monitor.actions.AddToScopeAction"
+                    text="添加到示波器"
+                    description="将光标处的全局/静态变量加入示波器采样"/>
+        </group>
+    </actions>
+</idea-plugin>

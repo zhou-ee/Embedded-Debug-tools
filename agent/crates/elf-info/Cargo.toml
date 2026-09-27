@@ -1,0 +1,12 @@
+[package]
+name = "elf-info"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+object = "0.36"
+gimli = "0.31"
+cpp_demangle = "0.4"

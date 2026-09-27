@@ -1,0 +1,9 @@
+build/
+.gradle/
+.intellijPlatform/
+.kotlin/
+.idea/
+bin/*.exe
+bin/*.pdb
+out/
+*.log

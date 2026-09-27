@@ -1,0 +1,10 @@
+[package]
+name = "svd-info"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde.workspace = true
+thiserror.workspace = true
+svd-parser = { version = "0.14", features = ["expand"] }
+svd-rs = "0.14"

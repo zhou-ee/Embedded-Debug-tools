@@ -1,0 +1,23 @@
+[package]
+name = "embedded-clion-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+description = "CLion 插件 sidecar：把 debug-core/monitor/elf-info 暴露为本地 TCP JSON 行协议"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+crossbeam-channel = { workspace = true }
+parking_lot = { workspace = true }
+debug-core = { path = "../debug-core" }
+monitor = { path = "../monitor" }
+elf-info = { path = "../elf-info" }
+
+[[bin]]
+name = "embedded-clion-agent"
+path = "src/main.rs"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Media"] }
