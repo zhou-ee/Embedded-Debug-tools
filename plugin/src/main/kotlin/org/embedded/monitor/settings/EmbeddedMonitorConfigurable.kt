@@ -23,6 +23,9 @@ class EmbeddedMonitorConfigurable(private val project: Project) : Configurable {
     private val openocdPathField = JBTextField(280)
     private val scriptsDirField = JBTextField(280)
     private val tclPortSpinner = javax.swing.JSpinner(javax.swing.SpinnerNumberModel(6666, 1, 65535, 1))
+    private val probeSerialField = com.intellij.ui.components.JBTextField(200).apply {
+        emptyText.text = "留空 = 使用第一个可用探针（probe-rs 后端）"
+    }
     private val attachOnlyCheck = JBCheckBox("attach-only：仅连接已运行的 OpenOCD（与 CLion 调试共存）", true)
     private val autoStartCheck = JBCheckBox("调试会话启动时自动开始监视", true)
     private val autoSwitchCheck = JBCheckBox("调试中自动切换为 OpenOCD attach-only（防止 probe-rs 端口冲突断联）", true)
@@ -48,6 +51,7 @@ class EmbeddedMonitorConfigurable(private val project: Project) : Configurable {
             .addLabeledComponent("OpenOCD 可执行文件：", openocdPathField)
             .addLabeledComponent("OpenOCD scripts 目录：", scriptsDirField)
             .addLabeledComponent("OpenOCD Tcl RPC 端口：", tclPortSpinner)
+            .addLabeledComponent("探针序列号（多探针时按 serial 选择）：", probeSerialField)
             .addComponentToRightColumn(attachOnlyCheck)
             .addComponentToRightColumn(autoStartCheck)
             .addComponentToRightColumn(autoSwitchCheck)
@@ -98,6 +102,7 @@ class EmbeddedMonitorConfigurable(private val project: Project) : Configurable {
         openocdPathField.text = s.openocdPath
         scriptsDirField.text = s.scriptsDir
         tclPortSpinner.value = s.tclPort
+        probeSerialField.text = s.probeSerial
         attachOnlyCheck.isSelected = s.attachOnly
         autoStartCheck.isSelected = s.autoStartWithDebug
         autoSwitchCheck.isSelected = s.autoSwitchBackendOnDebug
@@ -119,6 +124,7 @@ class EmbeddedMonitorConfigurable(private val project: Project) : Configurable {
             openocdPathField.text != s.openocdPath ||
             scriptsDirField.text != s.scriptsDir ||
             (tclPortSpinner.value as Int) != s.tclPort ||
+            probeSerialField.text.trim() != s.probeSerial ||
             attachOnlyCheck.isSelected != s.attachOnly ||
             autoStartCheck.isSelected != s.autoStartWithDebug ||
             autoSwitchCheck.isSelected != s.autoSwitchBackendOnDebug ||
@@ -141,6 +147,7 @@ class EmbeddedMonitorConfigurable(private val project: Project) : Configurable {
             s.openocdPath = openocdPathField.text.trim()
             s.scriptsDir = scriptsDirField.text.trim()
             s.tclPort = tclPortSpinner.value as Int
+            s.probeSerial = probeSerialField.text.trim()
             s.attachOnly = attachOnlyCheck.isSelected
             s.autoStartWithDebug = autoStartCheck.isSelected
             s.autoSwitchBackendOnDebug = autoSwitchCheck.isSelected

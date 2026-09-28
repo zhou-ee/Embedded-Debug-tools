@@ -47,5 +47,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$env:GITHUB_REF_NAME" --title "$env:GITHUB_REF_NAME" --generate-notes
+          # 先建 draft 上传产物，确认无误后发布——避免 upload 失败留下空 Release
+          gh release create "$env:GITHUB_REF_NAME" --title "$env:GITHUB_REF_NAME" --generate-notes --draft
           gh release upload "$env:GITHUB_REF_NAME" release/*.zip release/*.sha256
+          gh release edit "$env:GITHUB_REF_NAME" --draft=false

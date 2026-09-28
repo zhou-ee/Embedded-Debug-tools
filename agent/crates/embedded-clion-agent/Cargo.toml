@@ -7,7 +7,6 @@ license.workspace = true
 description = "CLion 插件 sidecar：把 debug-core/monitor/elf-info 暴露为本地 TCP JSON 行协议"
 
 [dependencies]
-serde = { workspace = true }
 serde_json = { workspace = true }
 crossbeam-channel = { workspace = true }
 parking_lot = { workspace = true }

@@ -41,9 +41,17 @@ pub fn list_probes() -> Vec<ProbeInfo> {
 /// 依序尝试打开列表中的探针，返回第一个可用实例（探针 + 标识）。
 /// 复合设备（如实测的 ATK-HS-V3）会枚举出多个实例且首个可能打不开，
 /// 盲选 probes[0] 会导致这类探针完全不可用。
-pub fn open_first_available() -> Result<(probe_rs::probe::Probe, String), String> {
+/// `serial_filter` 非 None 时只打开序列号匹配的探针（多探针系统防误连别家设备）。
+pub fn open_first_available(serial_filter: Option<&str>) -> Result<(probe_rs::probe::Probe, String), String> {
     let lister = Lister::new();
-    let probes = lister.list_all();
+    let mut probes = lister.list_all();
+    if let Some(want) = serial_filter {
+        let want = want.trim();
+        probes.retain(|p| p.serial_number.as_deref() == Some(want));
+        if probes.is_empty() {
+            return Err(format!("未找到序列号为 {want} 的调试探针（已连接探针列表见 list_probes）"));
+        }
+    }
     if probes.is_empty() {
         return Err("未检测到调试探针（CMSIS-DAP / ST-Link / J-Link）".into());
     }

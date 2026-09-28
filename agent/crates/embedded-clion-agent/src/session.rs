@@ -166,15 +166,17 @@ impl Session {
         }
     }
 
-    pub fn run(&self, mut reader: BufReader<TcpStream>) {
+    /// 服务一个会话直到断开；返回值 = 握手是否成功（false = 未授权/误连，
+    /// 调用方应回到 accept 继续等待真正的客户端而不是退出进程）。
+    pub fn run(&self, mut reader: BufReader<TcpStream>) -> bool {
         // 握手：第一条消息必须是携带正确 token 的 hello（防本机其它进程扫端口操控硬件）
         let mut first = String::new();
         match read_line_limited(&mut reader, &mut first) {
-            Ok(0) => return,
+            Ok(0) => return false,
             Ok(_) => {}
             Err(e) => {
                 eprintln!("[agent] 握手读取失败: {e}");
-                return;
+                return false;
             }
         }
         let parsed = parse_request(first.trim()).ok();
@@ -191,7 +193,7 @@ impl Session {
             let _ = self
                 .writer
                 .send(response_err(id, "握手失败：第一条消息必须是携带正确 token 的 hello（插件与 agent 版本需一致）"));
-            return;
+            return false;
         }
         // hello 是请求：回标准响应（含协议版本），供调用方同步确认握手成功
         let _ = self.writer.send(response_ok(
@@ -231,6 +233,7 @@ impl Session {
                 let _ = self.writer.send(response_err(req.id, e));
             }
         }
+        true
     }
 
     /// 同步方法分发；慢操作（elf_load）在内部子线程自行回响应。
@@ -538,6 +541,7 @@ fn parse_connect_params(p: &Value) -> Result<ConnectParams, String> {
         attach_only: p.get("attachOnly").and_then(Value::as_bool).unwrap_or(false),
         tcl_port: u16::try_from(p.get("tclPort").and_then(Value::as_u64).unwrap_or(6666))
             .map_err(|_| "tclPort 超出 u16 范围")?,
+        probe_serial: p.get("probeSerial").and_then(Value::as_str).map(str::to_string),
     })
 }
 
@@ -616,45 +620,67 @@ fn check_openocd_attachable(tcl_port: u16) -> Result<(), String> {
     }
 }
 
-/// 服务一个客户端直到断开；返回后由调用方收尾。
+/// 服务一个客户端直到断开；成功会话结束后由调用方收尾退出。
+/// 握手失败的连接（未授权扫描/误连）回到 accept 继续等待真正的客户端
+/// （此时插件的连接已在 backlog 排队，失败会话结束后立刻能被接上），
+/// 不再直接退出让插件拿到"已死"的 agent；accept 自身失败重试至多 10s。
 pub fn serve_one(listener: &TcpListener, token: String) {
-    let (stream, _peer) = listener.accept().expect("accept first client");
-    let _ = stream.set_nodelay(true);
-    let reader = BufReader::new(match stream.try_clone() {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("[agent] try_clone 失败: {e}");
+    let io_retry_deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let (stream, _peer) = match listener.accept() {
+            Ok(pair) => pair,
+            Err(e) => {
+                eprintln!("[agent] accept 失败（{e}），重试中…");
+                if std::time::Instant::now() >= io_retry_deadline {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+                continue;
+            }
+        };
+        let _ = stream.set_nodelay(true);
+        let reader = BufReader::new(match stream.try_clone() {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("[agent] try_clone 失败: {e}");
+                continue;
+            }
+        });
+        let (writer_tx, writer_rx) = unbounded::<String>();
+        let session = Arc::new(Session::new(writer_tx.clone(), token.clone()));
+
+        // writer 线程：独占 socket 写端
+        let wstream = stream;
+        let writer_thread = std::thread::Builder::new()
+            .name("agent-writer".into())
+            .spawn(move || {
+                let mut out = std::io::BufWriter::new(wstream);
+                for line in writer_rx {
+                    if out.write_all(line.as_bytes()).is_err() || out.flush().is_err() {
+                        break;
+                    }
+                }
+            })
+            .expect("spawn writer");
+
+        eprintln!("[agent] 客户端已接入");
+        let handshake_ok = session.run(reader);
+        if handshake_ok {
+            eprintln!("[agent] 客户端断开，关闭引擎");
+            session.shutdown_engine();
+        }
+        // 关键：给 writer 一个有界冲刷窗口。若不等待，进程退出会杀掉 writer 线程，
+        // 排队中的最后一串响应/事件（如握手拒绝错误、Disconnected 事件）可能整体丢失，
+        // 插件侧只会看到连接关闭而无错误信息
+        drop(session);
+        drop(writer_tx);
+        let deadline = std::time::Instant::now() + Duration::from_millis(500);
+        while !writer_thread.is_finished() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        if handshake_ok {
             return;
         }
-    });
-    let (writer_tx, writer_rx) = unbounded::<String>();
-    let session = Arc::new(Session::new(writer_tx.clone(), token));
-
-    // writer 线程：独占 socket 写端
-    let wstream = stream;
-    let writer_thread = std::thread::Builder::new()
-        .name("agent-writer".into())
-        .spawn(move || {
-            let mut out = std::io::BufWriter::new(wstream);
-            for line in writer_rx {
-                if out.write_all(line.as_bytes()).is_err() || out.flush().is_err() {
-                    break;
-                }
-            }
-        })
-        .expect("spawn writer");
-
-    eprintln!("[agent] 客户端已接入");
-    session.run(reader);
-    eprintln!("[agent] 客户端断开，关闭引擎");
-    session.shutdown_engine();
-    // 关键：给 writer 一个有界冲刷窗口。若不等待，进程退出会杀掉 writer 线程，
-    // 排队中的最后一串响应/事件（如握手拒绝错误、Disconnected 事件）可能整体丢失，
-    // 插件侧只会看到连接关闭而无错误信息
-    drop(session);
-    drop(writer_tx);
-    let deadline = std::time::Instant::now() + Duration::from_millis(500);
-    while !writer_thread.is_finished() && std::time::Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(10));
+        eprintln!("[agent] 握手失败的连接已断开，继续等待真实客户端");
     }
 }

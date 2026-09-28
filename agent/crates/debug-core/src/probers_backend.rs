@@ -3,7 +3,7 @@
 use probe_rs::{CoreInterface, MemoryInterface, Permissions, Session};
 use std::time::{Duration, Instant};
 
-use crate::{BackendError, DebugBackend};
+use crate::{BackendError, BurstFrames, DebugBackend};
 
 /// `session.core()` 连续失败到该次数才升级为"连接丢失"。
 /// 单次失败按瞬时错误处理（该方法每次都会重新 attach 访问端口，失败未必是断线）。
@@ -56,6 +56,8 @@ const EXT_RAM_HI: u64 = 0xA000_0000;
 pub struct ProbeRsBackend {
     target: String,
     speed_hz: u32,
+    /// 按序列号选择探针（多探针系统；None = 第一个可用）
+    probe_serial: Option<String>,
     session: Option<Session>,
     /// core() 连续失败计数
     core_fail_streak: u32,
@@ -66,9 +68,16 @@ impl ProbeRsBackend {
         Self {
             target,
             speed_hz,
+            probe_serial: None,
             session: None,
             core_fail_streak: 0,
         }
+    }
+
+    /// 按序列号选择探针（多探针系统；None = 第一个可用）。
+    pub fn with_serial(mut self, serial: Option<String>) -> Self {
+        self.probe_serial = serial.filter(|s| !s.trim().is_empty());
+        self
     }
 
     /// 直接接管一个已存在的会话（烧录后复用连接等场景）。
@@ -76,6 +85,7 @@ impl ProbeRsBackend {
         Self {
             target,
             speed_hz,
+            probe_serial: None,
             session: Some(session),
             core_fail_streak: 0,
         }
@@ -146,7 +156,7 @@ impl DebugBackend for ProbeRsBackend {
         }
         // 复合设备（如 ATK-HS-V3）会枚举出多个实例且首个可能打不开，
         // 必须逐个尝试，不能盲选 probes[0]
-        let (mut probe, ident) = crate::probe::open_first_available()
+        let (mut probe, ident) = crate::probe::open_first_available(self.probe_serial.as_deref())
             .map_err(BackendError::ConnectionLost)?;
         // 亚 kHz 输入整除得 0，set_speed(0) 无效且错误被吞，最终静默用探针默认
         // 速率、与 Connected 事件报告的 "@0kHz" 自相矛盾——钳到 1kHz
@@ -189,7 +199,7 @@ impl DebugBackend for ProbeRsBackend {
         if len == 0 {
             return Ok(Vec::new());
         }
-        if addr % 4 == 0 && len % 4 == 0 {
+        if addr.is_multiple_of(4) && len % 4 == 0 {
             let mut words = vec![0u32; len / 4];
             if core.read_32(addr, &mut words).is_ok() {
                 let mut bytes = Vec::with_capacity(len);
@@ -275,7 +285,7 @@ impl DebugBackend for ProbeRsBackend {
         blocks: &[(u64, usize)],
         count: usize,
         interval: Duration,
-    ) -> Result<Vec<(Duration, Vec<Vec<u8>>)>, BackendError> {
+    ) -> Result<BurstFrames, BackendError> {
         let start = Instant::now();
         let mut core = self.core()?;
         let mut out = Vec::with_capacity(count);
@@ -347,10 +357,10 @@ impl DebugBackend for ProbeRsBackend {
         let registers = core.registers();
         let lower = name.to_lowercase();
 
-        fn by_role<'r>(
-            registers: &'r probe_rs::CoreRegisters,
+        fn by_role(
+            registers: &probe_rs::CoreRegisters,
             role: RegisterRole,
-        ) -> Option<&'r probe_rs::CoreRegister> {
+        ) -> Option<&probe_rs::CoreRegister> {
             registers
                 .all_registers()
                 .find(|r| r.register_has_role(role))

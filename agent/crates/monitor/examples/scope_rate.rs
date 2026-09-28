@@ -75,11 +75,8 @@ fn main() {
     let deadline = Instant::now() + Duration::from_secs(secs);
     let mut stamps: Vec<f64> = Vec::new();
     while Instant::now() < deadline {
-        match rx.recv_timeout(Duration::from_millis(100)) {
-            Ok(Event::ScopeData { samples }) => {
-                stamps.extend(samples.iter().map(|s| s.t));
-            }
-            _ => {}
+        if let Ok(Event::ScopeData { samples }) = rx.recv_timeout(Duration::from_millis(100)) {
+            stamps.extend(samples.iter().map(|s| s.t));
         }
     }
     let wall = secs as f64;

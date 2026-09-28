@@ -92,7 +92,7 @@ fn main() {
 
     if !skip_flash {
         println!("== B. 烧录 ==");
-        let r = debug_core::flash::flash_firmware(TARGET, 2_000_000, std::path::Path::new(ELF), debug_core::flash::FlashMode::Run, |_| {});
+        let r = debug_core::flash::flash_firmware(TARGET, 2_000_000, std::path::Path::new(ELF), debug_core::flash::FlashMode::Run, None, |_| {});
         check(r.is_ok(), "烧录", &format!("{:?}", r.err()));
     }
 

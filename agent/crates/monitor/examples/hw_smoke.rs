@@ -105,6 +105,7 @@ fn main() {
             2_000_000, // Flash Pro 克隆探针 4MHz 不稳（OpenOCD 默认也只用 2MHz）
             &elf_path,
             debug_core::flash::FlashMode::Run,
+            None,
             |ev| match ev {
                 debug_core::flash::FlashEvent::Log { text } => println!("    [flash] {text}"),
                 debug_core::flash::FlashEvent::Progress { phase, percent } => {
@@ -173,7 +174,7 @@ fn main() {
         st.check("Watch 采样", d1.is_some(), &format!("uwTick = {v1}"));
         let d2 = wait_for(&rx, Duration::from_secs(3), |e| {
             matches!(e, Event::WatchData { values, .. }
-                if values.get("uwTick").map(watch_u32_val) > Some(v1))
+                if values.get("uwTick").map(|b| watch_u32_val(b)) > Some(v1))
         });
         let v2 = watch_u32(&d2, "uwTick");
         st.check("运行中递增", d2.is_some(), &format!("{v1} → {v2}（HAL Tick 1ms）"));
@@ -405,7 +406,7 @@ fn watch_u32(ev: &Option<Event>, id: &str) -> u32 {
         _ => Vec::new(),
     })
 }
-fn watch_u32_val(bytes: &Vec<u8>) -> u32 {
+fn watch_u32_val(bytes: &[u8]) -> u32 {
     if bytes.len() >= 4 {
         u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
     } else {

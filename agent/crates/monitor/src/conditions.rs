@@ -255,11 +255,7 @@ impl<'a> Parser<'a> {
         let first = self.parse_bitor()?;
         let mut prev = first;
         let mut result: Option<bool> = None;
-        loop {
-            let op = match self.peek() {
-                Some(t @ (Tok::Eq | Tok::Ne | Tok::Le | Tok::Ge | Tok::Lt | Tok::Gt)) => t,
-                _ => break,
-            };
+        while let Some(op @ (Tok::Eq | Tok::Ne | Tok::Le | Tok::Ge | Tok::Lt | Tok::Gt)) = self.peek() {
             self.next();
             let right = self.parse_bitor()?;
             let ok = match op {

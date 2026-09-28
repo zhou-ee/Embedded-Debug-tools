@@ -58,7 +58,7 @@ impl Ctx {
                     }
                 }
                 Ok(Event::Error { message }) => println!("  [Error] {message}"),
-                Ok(Event::State { state }) if state == TargetState::Halted => {
+                Ok(Event::State { state: TargetState::Halted }) => {
                     self.tx.send(Command::RequestRegsAndStack).unwrap();
                 }
                 Ok(Event::RegsAndStack { regs, .. }) => {
@@ -107,7 +107,7 @@ impl Ctx {
         let mut n = 0usize;
         while Instant::now() < deadline {
             match self.rx.recv_timeout(Duration::from_millis(200)) {
-                Ok(Event::State { state }) if state == TargetState::Halted => {
+                Ok(Event::State { state: TargetState::Halted }) => {
                     n += 1;
                     self.resume(); // 清除了还停的话必须续跑，否则卡在停住态
                 }

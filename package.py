@@ -4,6 +4,7 @@ Embedded Debug Tools 官方发布打包脚本
 自动编译 Rust Agent，构建前端 CLion 插件，并输出包含 Standalone（内置 Agent）的完整分发包。
 """
 import os
+import re
 import sys
 import shutil
 import zipfile
@@ -50,9 +51,28 @@ def get_plugin_version():
     sys.exit(1)
 
 
+def get_agent_version():
+    """从 workspace Cargo.toml 读取 agent 版本（与插件版本联动是发布约定）。"""
+    with open(os.path.join(AGENT_DIR, "Cargo.toml"), "r", encoding="utf-8") as f:
+        for line in f:
+            m = re.match(r'\s*version\s*=\s*"([^"]+)"', line)
+            if m:
+                return m.group(1)
+    return None
+
+
 def package():
     os.makedirs(RELEASE_DIR, exist_ok=True)
     version = get_plugin_version()
+    agent_version = get_agent_version()
+    # 版本联动断言：plugin version=V1.2.18 ↔ agent Cargo.toml 1.2.18
+    if agent_version and version.lower().lstrip("v") != agent_version:
+        print(
+            f"[!] 版本联动校验失败：插件 {version} 与 agent {agent_version} 不一致，"
+            f"请同步 plugin/gradle.properties 与 agent/Cargo.toml 后重试",
+            file=sys.stderr,
+        )
+        sys.exit(1)
     print(f"[*] 开始打包 Embedded Debug Tools 发布版本: {version}")
 
     # 1. 编译最新的 Rust Agent

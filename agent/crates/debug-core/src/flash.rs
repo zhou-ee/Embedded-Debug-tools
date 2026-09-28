@@ -21,9 +21,9 @@ pub enum FlashEvent {
     Done { success: bool, message: String },
 }
 
-/// 打开 probe-rs 会话：依序尝试可用探针 + 指定目标。
-pub fn open_session(target: &str, speed_hz: u32) -> Result<Session, String> {
-    let (mut probe, _ident) = crate::probe::open_first_available()?;
+/// 打开 probe-rs 会话：依序尝试可用探针（可按 serial 过滤）+ 指定目标。
+pub fn open_session(target: &str, speed_hz: u32, serial: Option<&str>) -> Result<Session, String> {
+    let (mut probe, _ident) = crate::probe::open_first_available(serial)?;
     let _ = probe.set_speed(speed_hz / 1000); // set_speed 单位 kHz
     let session = if target.trim().is_empty() {
         probe
@@ -49,9 +49,10 @@ pub fn flash_firmware(
     speed_hz: u32,
     firmware: &Path,
     mode: FlashMode,
+    serial: Option<&str>,
     on_event: impl Fn(FlashEvent) + Send + Sync + 'static,
 ) -> Result<(), String> {
-    let mut session = open_session(target, speed_hz)?;
+    let mut session = open_session(target, speed_hz, serial)?;
     on_event(FlashEvent::Log {
         text: format!("已连接目标 {}", session.target().name),
     });

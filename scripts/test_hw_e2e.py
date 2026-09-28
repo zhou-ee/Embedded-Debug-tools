@@ -102,10 +102,18 @@ bad = Client(int(fields["port"]), token=fields.get("token"), hello_token="deadbe
 resp = bad.hello_resp
 check("错误 token 被拒（ok=false）", resp is not None and resp.get("ok") is False,
       str((resp or {}).get("error", ""))[:60])
+time.sleep(0.5)
+check("拒绝后 agent 保持存活（误连不再杀死进程）", proc.poll() is None,
+      f"exit={proc.poll()}")
+# 随后真实客户端（正确 token）连上：backlog 排队的连接应被 accept 并正常握手
+good = Client(int(fields["port"]), token=fields.get("token"))
+check("真实客户端随后连接成功", good.hello_resp is not None and good.hello_resp.get("ok") is True,
+      str((good.hello_resp or {}).get("result", ""))[:60])
+good.sock.close()
 t0 = time.time()
 while proc.poll() is None and time.time() - t0 < 5:
     time.sleep(0.1)
-check("拒绝后 agent 退出", proc.poll() is not None, f"exit={proc.poll()}")
+check("会话结束 agent 干净退出", proc.poll() == 0, f"exit={proc.poll()}")
 if proc.poll() is None:
     proc.kill()
 
@@ -114,10 +122,17 @@ proc, fields = spawn_agent()
 nohello = Client(int(fields["port"]), send_hello=False)
 resp = nohello.call("status", timeout=4)
 check("无 hello 被拒（ok=false）", resp.get("ok") is False, resp.get("error", "")[:60])
+time.sleep(0.5)
+check("拒绝后 agent 保持存活（误连不再杀死进程）", proc.poll() is None,
+      f"exit={proc.poll()}")
+good = Client(int(fields["port"]), token=fields.get("token"))
+check("真实客户端随后连接成功", good.hello_resp is not None and good.hello_resp.get("ok") is True,
+      str((good.hello_resp or {}).get("result", ""))[:60])
+good.sock.close()
 t0 = time.time()
 while proc.poll() is None and time.time() - t0 < 5:
     time.sleep(0.1)
-check("拒绝后 agent 退出", proc.poll() is not None, f"exit={proc.poll()}")
+check("会话结束 agent 干净退出", proc.poll() == 0, f"exit={proc.poll()}")
 if proc.poll() is None:
     proc.kill()
 

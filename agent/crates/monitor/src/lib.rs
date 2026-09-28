@@ -53,14 +53,6 @@ pub struct SymbolRef {
     pub signed: bool,
 }
 
-/// GDB 表达式监视目标。
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ExprTarget {
-    pub id: String,
-    pub expr: String,
-}
-
 #[derive(Debug)]
 pub enum Command {
     Connect(ConnectParams),
@@ -89,10 +81,6 @@ pub enum Command {
     ReadWatchpoints {
         reply: Sender<Vec<u64>>,
     },
-    /// 配置 GDB 表达式求值（仅 OpenOCD 后端）。
-    ConfigureGdb { gdb_path: String, elf_path: String },
-    /// 更新表达式监视目标（GDB 求值，halt 时刷新）。
-    UpdateExprTargets(Vec<ExprTarget>),
     /// 同步写内存：写入结果必须回传调用方——此前返回值被丢弃，
     /// 探针未连接/地址不可写时插件也收到 ok，用户误以为已改成功
     WriteMemSync {
@@ -130,10 +118,6 @@ pub enum Event {
     /// 示波器批量采样：[(秒时间戳, addrHex → 字节)]
     ScopeData {
         samples: Vec<ScopeSample>,
-    },
-    /// GDB 表达式求值结果（id → 显示字符串）
-    ExprData {
-        values: HashMap<String, String>,
     },
     BreakpointHit {
         pc: u64,
@@ -217,12 +201,6 @@ pub fn spawn_engine() -> MonitorHandle {
     }
 }
 
-/// GDB 启动失败退避：3s 起步、每失败一次翻倍、60s 封顶。
-/// 固定 3s 会在 gdb_port 不匹配时无限刷"连接失败"日志。
-fn gdb_backoff(fail_count: u32) -> Duration {
-    Duration::from_secs((3u64.saturating_mul(1 << fail_count.min(4))).min(60))
-}
-
 // Cortex-M 调试寄存器（内存映射，**必须 32 位访问**——字节访问会被硬件静默
 // 忽略，真机实测 G431：经 write_8 写 DWT_COMP0 0xDEADBEEF 只落地最高字节。
 // 故一律经 `DebugBackend::read_u32`/`write_u32`，不要用 read_bytes/write_bytes）
@@ -298,18 +276,6 @@ struct Engine {
     held_break_addr: Option<u64>,
     /// 步进用临时断点（停住后清除）
     temp_bps: Vec<u64>,
-    /// GDB 表达式求值（仅 OpenOCD）
-    gdb: Option<debug_core::gdb_mi::GdbEvaluator>,
-    gdb_config: Option<(String, String)>, // (gdb_path, elf_path)
-    gdb_retry_at: Instant,
-    /// GDB 启动/连接在独立线程进行（符号加载实测 3.6s、上限 30s——同步做会冻结
-    /// 引擎线程，期间 Halt/Resume/采样全部停摆）；结果经此通道回收
-    gdb_result_rx: Option<std::sync::mpsc::Receiver<Result<debug_core::gdb_mi::GdbEvaluator, String>>>,
-    /// 是否已有在飞的 GDB 启动尝试
-    gdb_attempting: bool,
-    /// 连续失败次数（退避递增：3s→6s→…→60s 封顶，避免端口不匹配时刷屏重试）
-    gdb_fail_count: u32,
-    expr_targets: Vec<ExprTarget>,
     /// 非致命错误限流（同文本 1 秒内只上报一条）
     last_error_text: String,
     last_error_at: Instant,
@@ -350,13 +316,6 @@ impl Engine {
             scope_blocks: Vec::new(),
             held_break_addr: None,
             temp_bps: Vec::new(),
-            gdb: None,
-            gdb_config: None,
-            gdb_retry_at: now,
-            gdb_result_rx: None,
-            gdb_attempting: false,
-            gdb_fail_count: 0,
-            expr_targets: Vec::new(),
             // 空文本与任何错误都不同，首条错误必然放行
             last_error_text: String::new(),
             last_error_at: now,
@@ -380,9 +339,6 @@ impl Engine {
             if self.shutdown {
                 break;
             }
-
-            // 回收异步 GDB 启动结果（不阻塞引擎循环）
-            self.poll_gdb_result();
 
             if self.backend.is_none() && self.params.is_some() {
                 self.try_reconnect();
@@ -634,8 +590,6 @@ impl Engine {
                 self.poll_state();
                 if !landed {
                     self.send_regs_and_stack();
-                    // halted→halted 时 poll_state 不发事件也不求值，这里补一次表达式刷新
-                    self.eval_expressions();
                 }
             }
             Command::StepOver { next_line_addr } => {
@@ -652,27 +606,11 @@ impl Engine {
                 self.with_backend(|b| b.reset_and_halt());
                 self.applied_bps.clear();
                 self.apply_breakpoints();
-                if self.backend.is_some() {
-                    if self.with_backend(|b| b.resume()).is_some() {
+                if self.backend.is_some()
+                    && self.with_backend(|b| b.resume()).is_some() {
                         self.mark_running();
                     }
-                }
                 self.poll_state();
-            }
-            Command::ConfigureGdb { gdb_path, elf_path } => {
-                self.gdb_config = Some((gdb_path, elf_path));
-                self.gdb = None;
-                // 丢弃在飞的旧尝试（其结果通道随 rx 一起丢弃，尝试线程发送失败后自行退出）
-                self.gdb_result_rx = None;
-                self.gdb_attempting = false;
-                self.gdb_fail_count = 0;
-                self.gdb_retry_at = Instant::now();
-            }
-            Command::UpdateExprTargets(targets) => {
-                self.expr_targets = targets;
-                if self.last_state == Some(true) {
-                    self.eval_expressions();
-                }
             }
             Command::WriteMemSync { addr, data, reply } => {
                 let result = match self.with_backend(|b| b.write_bytes(addr, &data)) {
@@ -723,10 +661,13 @@ impl Engine {
         let Some(params) = self.params.clone() else { return };
 
         let mut backend: Box<dyn DebugBackend> = match params.kind {
-            BackendKind::ProbeRs => Box::new(ProbeRsBackend::new(
-                params.target.clone().unwrap_or_default(),
-                params.speed_hz,
-            )),
+            BackendKind::ProbeRs => Box::new(
+                ProbeRsBackend::new(
+                    params.target.clone().unwrap_or_default(),
+                    params.speed_hz,
+                )
+                .with_serial(params.probe_serial.clone()),
+            ),
             BackendKind::Openocd => {
                 let openocd = params.openocd_path.clone().unwrap_or_else(|| "openocd".into());
                 let cfg = params.cfg_file.clone().unwrap_or_default();
@@ -792,7 +733,7 @@ impl Engine {
             }
             self.applied_bps.clear();
             self.last_state = None;
-            if self.params.as_ref().map_or(false, |p| p.attach_only) {
+            if self.params.as_ref().is_some_and(|p| p.attach_only) {
                 self.params = None;
             }
             self.emit(Event::State {
@@ -820,8 +761,7 @@ impl Engine {
         &mut self,
         f: impl FnOnce(&mut Box<dyn DebugBackend>) -> Result<T, BackendError>,
     ) -> Option<T> {
-        let Some(backend) = self.backend.as_mut() else { return None };
-        match f(backend) {
+        match f(self.backend.as_mut()?) {
             Ok(v) => Some(v),
             Err(e) => {
                 self.on_backend_error(e);
@@ -914,11 +854,6 @@ impl Engine {
             if halted {
                 self.clear_temp_bps();
                 self.on_halted();
-                // on_halted 条件为假时已 mark_running 恢复运行，
-                // 此时不能对运行中的目标做 GDB 求值（会把 <error> 刷进 Watch）
-                if self.last_state == Some(true) {
-                    self.eval_expressions();
-                }
             } else {
                 self.held_break_addr = None;
             }
@@ -1075,15 +1010,12 @@ impl Engine {
             let func = DWT_FUNCTION + 0x10 * n as u64;
             // 先关比较器再改参数，避免重编程过程中产生假匹配
             self.with_backend(|b| b.write_u32(func, 0));
-            match addrs.get(n) {
-                Some(&addr) => {
-                    self.with_backend(|b| b.write_u32(comp, addr as u32));
-                    // MASK=2：匹配 4 字节区域
-                    self.with_backend(|b| b.write_u32(mask, 2));
-                    // 最后写 FUNCTION 使能（DATAVSIZE=4B，读或写触发停机）
-                    self.with_backend(|b| b.write_u32(func, DWT_FN_DATA_RW_4B));
-                }
-                None => {}
+            if let Some(&addr) = addrs.get(n) {
+                self.with_backend(|b| b.write_u32(comp, addr as u32));
+                // MASK=2：匹配 4 字节区域
+                self.with_backend(|b| b.write_u32(mask, 2));
+                // 最后写 FUNCTION 使能（DATAVSIZE=4B，读或写触发停机）
+                self.with_backend(|b| b.write_u32(func, DWT_FN_DATA_RW_4B));
             }
         }
         self.watchpoints = addrs.to_vec();
@@ -1146,7 +1078,7 @@ impl Engine {
             let dwt_trap = dfsr & (1 << 2) != 0;
             for (n, &addr) in watchpoints.iter().enumerate() {
                 let func = DWT_FUNCTION + 0x10 * n as u64;
-                if fns.get(n).map_or(false, |fv| fv & (1 << 24) != 0) {
+                if fns.get(n).is_some_and(|fv| fv & (1 << 24) != 0) {
                     watch_hit = Some(format!("{addr:#010x}"));
                     self.with_backend(|b| b.write_u32(func, 0));
                     self.with_backend(|b| b.write_u32(func, DWT_FN_DATA_RW_4B));
@@ -1327,7 +1259,6 @@ impl Engine {
                 self.step_over_breakpoint();
                 self.poll_state();
                 self.send_regs_and_stack();
-                self.eval_expressions();
             }
         }
     }
@@ -1363,89 +1294,6 @@ impl Engine {
             self.mark_running();
         }
         self.poll_state();
-    }
-
-    /// GDB 表达式求值（halt 时调用）。
-    fn eval_expressions(&mut self) {
-        if self.expr_targets.is_empty() {
-            return;
-        }
-        self.ensure_gdb();
-        let Some(gdb) = self.gdb.as_mut() else { return };
-        let mut values = HashMap::new();
-        for target in &self.expr_targets {
-            let text = match gdb.evaluate(&target.expr) {
-                Ok(v) => v,
-                Err(e) => format!("<error: {e}>"),
-            };
-            values.insert(target.id.clone(), text);
-        }
-        if !values.is_empty() {
-            self.emit(Event::ExprData { values });
-        }
-    }
-
-    /// 惰性启动 GDB（异步：启动/连接在独立线程，完成结果由 poll_gdb_result 回收）。
-    /// 此前在引擎线程同步执行符号加载（实测 3.6s、上限 30s）+ 两次 target-select，
-    /// 期间所有 Command（含 Halt/Resume）停摆，表现为"断点命中后 UI 卡死"。
-    fn ensure_gdb(&mut self) {
-        if self.gdb.is_some() || self.gdb_attempting {
-            return;
-        }
-        let Some((gdb_path, elf_path)) = self.gdb_config.clone() else { return };
-        if Instant::now() < self.gdb_retry_at {
-            return;
-        }
-        self.gdb_attempting = true;
-        self.gdb_retry_at = Instant::now() + gdb_backoff(self.gdb_fail_count);
-        let (tx, rx) = std::sync::mpsc::channel();
-        self.gdb_result_rx = Some(rx);
-        let spawn_res = std::thread::Builder::new()
-            .name("gdb-eval-connect".into())
-            .spawn(move || {
-                // gdb server 端口：OpenOCD cfg 默认 gdb_port 3333；cfg 显式改过时
-                // 需在 cfg 中保持 3333 或后续经协议下发（当前协议未传，维持原版行为）
-                let res = debug_core::gdb_mi::GdbEvaluator::spawn(&gdb_path)
-                    .and_then(|mut g| g.connect(&elf_path, 3333).map(|_| g));
-                let _ = tx.send(res);
-            });
-        if spawn_res.is_err() {
-            self.gdb_attempting = false;
-            self.gdb_result_rx = None;
-        }
-    }
-
-    /// 非阻塞回收 GDB 启动结果；每次引擎循环调用一次。
-    fn poll_gdb_result(&mut self) {
-        let Some(rx) = self.gdb_result_rx.as_ref() else { return };
-        match rx.try_recv() {
-            Ok(Ok(gdb)) => {
-                self.gdb = Some(gdb);
-                self.gdb_result_rx = None;
-                self.gdb_attempting = false;
-                self.gdb_fail_count = 0;
-                self.emit(Event::Log {
-                    message: "GDB 表达式求值已连接 (:3333)".into(),
-                });
-            }
-            Ok(Err(e)) => {
-                self.gdb_result_rx = None;
-                self.gdb_attempting = false;
-                self.gdb_fail_count += 1;
-                self.gdb_retry_at = Instant::now() + gdb_backoff(self.gdb_fail_count);
-                self.emit(Event::Log {
-                    message: format!(
-                        "GDB 连接失败（{} 秒后重试）: {e}",
-                        gdb_backoff(self.gdb_fail_count).as_secs()
-                    ),
-                });
-            }
-            Err(std::sync::mpsc::TryRecvError::Empty) => {}
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                self.gdb_result_rx = None;
-                self.gdb_attempting = false;
-            }
-        }
     }
 
     /// resume 发出后强制记为 running 并发事件。
@@ -1602,7 +1450,7 @@ impl Engine {
                     let t = t0 + offset.as_secs_f64();
                     // 帧 = 与 blocks 同序的各块数据 → 配回块地址供 extract 使用
                     let mut block_data: Vec<(u64, Vec<u8>)> = Vec::with_capacity(frame.len());
-                    for ((addr, _size), data) in blocks.iter().zip(frame.into_iter()) {
+                    for ((addr, _size), data) in blocks.iter().zip(frame) {
                         block_data.push((*addr, data));
                     }
                     let mut values = HashMap::with_capacity(self.scope_targets.len());

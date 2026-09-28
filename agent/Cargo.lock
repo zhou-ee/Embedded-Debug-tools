@@ -529,7 +529,6 @@ dependencies = [
  "object 0.36.7",
  "serde",
  "thiserror 2.0.21",
- "tracing",
 ]
 
 [[package]]
@@ -541,7 +540,6 @@ dependencies = [
  "elf-info",
  "monitor",
  "parking_lot",
- "serde",
  "serde_json",
  "windows-sys 0.59.0",
 ]
@@ -1133,7 +1131,6 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.21",
- "tracing",
  "windows-sys 0.59.0",
 ]
 

@@ -16,6 +16,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: "agent -> agent/target"
+      - name: Clippy Lint Gate
+        working-directory: agent
+        # 静态检查门禁：任何 warning/error 都使 CI 变红（本地已清零）
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Run Cargo Tests
         working-directory: agent
         # --locked：依赖图以 Cargo.lock 为准，防止 CI 悄悄升级依赖
@@ -45,6 +49,11 @@ jobs:
       - name: Run Plugin Tests
         working-directory: plugin
         run: ./gradlew test
+      - name: Verify Plugin (API/ABI compatibility check)
+        working-directory: plugin
+        # 插件验证：对固定版本 CLion 2026.2.2 校验 since-build 与 API 兼容性
+        # （构建依赖已 pinned 同版本，verifyPlugin 复用缓存离线可跑）
+        run: ./gradlew verifyPlugin
       - name: Build Plugin Distribution
         working-directory: plugin
         run: ./gradlew buildPlugin

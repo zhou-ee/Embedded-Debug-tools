@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use crate::{BackendError, DebugBackend};
+use crate::{BackendError, BurstFrames, DebugBackend};
 
 const TCL_PORT: u16 = 6666;
 const FRAME: u8 = 0x1a; // Ctrl+Z
@@ -138,6 +138,19 @@ impl OpenOcdBackend {
             "OpenOCD Tcl 端口 ({}) 等待超时",
             self.tcl_port
         )))
+    }
+
+    /// 临时放宽读超时执行慢命令：`reset halt` 在复位序列完成后才返回，
+    /// 默认 2.5s 读超时对带看门狗/慢时钟的目标会误判连接丢失并拆流重建。
+    fn tcl_slow(&mut self, cmd: &str, read_timeout: Duration) -> Result<String, BackendError> {
+        if let Some(stream) = self.stream.as_ref() {
+            let _ = stream.get_ref().set_read_timeout(Some(read_timeout));
+        }
+        let r = self.tcl(cmd);
+        if let Some(stream) = self.stream.as_ref() {
+            let _ = stream.get_ref().set_read_timeout(Some(Duration::from_millis(2500)));
+        }
+        r
     }
 
     /// 发送 Tcl 命令并读取响应（Ctrl+Z 结尾帧）。
@@ -308,7 +321,7 @@ impl DebugBackend for OpenOcdBackend {
         if len == 0 {
             return Ok(Vec::new());
         }
-        if addr % 4 == 0 && len % 4 == 0 {
+        if addr.is_multiple_of(4) && len.is_multiple_of(4) {
             let words = len / 4;
             if let Ok(resp) = self.tcl(&format!("read_memory 0x{addr:x} 32 {words}")) {
                 let lower = resp.to_lowercase();
@@ -418,12 +431,12 @@ impl DebugBackend for OpenOcdBackend {
     }
 
     fn reset(&mut self) -> Result<(), BackendError> {
-        let resp = self.tcl("reset run")?;
+        let resp = self.tcl_slow("reset run", Duration::from_secs(10))?;
         check_inband_error(&resp)
     }
 
     fn reset_and_halt(&mut self) -> Result<(), BackendError> {
-        let resp = self.tcl("reset halt")?;
+        let resp = self.tcl_slow("reset halt", Duration::from_secs(10))?;
         check_inband_error(&resp)
     }
 
@@ -489,7 +502,7 @@ impl DebugBackend for OpenOcdBackend {
         blocks: &[(u64, usize)],
         count: usize,
         interval: Duration,
-    ) -> Result<Vec<(Duration, Vec<Vec<u8>>)>, BackendError> {
+    ) -> Result<BurstFrames, BackendError> {
         let start = Instant::now();
         let mut out = Vec::with_capacity(count);
         for i in 0..count {

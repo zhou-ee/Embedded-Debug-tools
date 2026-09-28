@@ -133,6 +133,9 @@ class RegisterLiveWatchPanel(private val project: Project) : JBPanel<RegisterLiv
         font = JBFont.small()
         foreground = JBColor.GRAY
     }
+    /** 读内存失败/空返回计数（成功后清零），反馈到状态栏避免"数值停在旧值"不可见 */
+    private val readFailCount = java.util.concurrent.atomic.AtomicInteger(0)
+
     private val statusLabel = JBLabel("就绪").apply {
         font = JBFont.small()
         foreground = JBColor.GRAY
@@ -544,8 +547,10 @@ class RegisterLiveWatchPanel(private val project: Project) : JBPanel<RegisterLiv
             val hasAuto = autoRefreshAll || autoRefreshPaths.isNotEmpty()
             if (hasAuto) {
                 val countText = if (autoRefreshAll) "全部展开项" else "${autoRefreshPaths.size} 项已勾选"
-                statusLabel.text = "● 动态刷新中 ($countText @ ${autoRefreshFreq}Hz)"
-                statusLabel.foreground = JBColor(0x2E7D32, 0x4EC9B0)
+                val failN = readFailCount.get()
+                val failText = if (failN > 0) " · 连续读取失败 $failN 次" else ""
+                statusLabel.text = "● 动态刷新中 ($countText @ ${autoRefreshFreq}Hz)$failText"
+                statusLabel.foreground = if (failN > 0) JBColor(0xE65100, 0xFFB74D) else JBColor(0x2E7D32, 0x4EC9B0)
             } else {
                 statusLabel.text = "就绪 · 运行中"
                 statusLabel.foreground = JBColor.GRAY
@@ -851,7 +856,11 @@ class RegisterLiveWatchPanel(private val project: Project) : JBPanel<RegisterLiv
         val svc = agentService ?: return
         for (block in blocks) {
             svc.readMem(block.start, block.size).thenAccept { bytes ->
-                if (bytes.isNotEmpty()) {
+                if (bytes.isEmpty()) {
+                    readFailCount.incrementAndGet()
+                    UIUtil.invokeLaterIfNeeded { updateStatusLabel() }
+                } else {
+                    readFailCount.set(0)
                     for (reg in block.regs) {
                         val off = (reg.address - block.start).toInt()
                         var v = 0L
@@ -868,6 +877,8 @@ class RegisterLiveWatchPanel(private val project: Project) : JBPanel<RegisterLiv
                     }
                 }
             }.exceptionally {
+                readFailCount.incrementAndGet()
+                UIUtil.invokeLaterIfNeeded { updateStatusLabel() }
                 null
             }
         }

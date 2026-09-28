@@ -9,7 +9,6 @@ elf-info = { path = "../elf-info" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-tracing.workspace = true
 parking_lot.workspace = true
 crossbeam-channel.workspace = true
 

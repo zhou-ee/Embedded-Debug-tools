@@ -49,6 +49,9 @@ pub struct ConnectParams {
     /// OpenOCD Tcl RPC 端口，默认 6666。
     #[serde(default = "default_tcl_port")]
     pub tcl_port: u16,
+    /// 按序列号选择探针（多探针系统；None = 第一个可用）。
+    #[serde(default)]
+    pub probe_serial: Option<String>,
 }
 
 fn default_speed() -> u32 {
@@ -66,6 +69,7 @@ impl Default for ConnectParams {
             speed_hz: default_speed(),
             attach_only: false,
             tcl_port: default_tcl_port(),
+            probe_serial: None,
         }
     }
 }

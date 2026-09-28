@@ -126,9 +126,9 @@ impl DebugBackend for SimBackend {
                 out.push(Self::gen_byte(t, a - SIM_RAM_BASE));
             } else if (SIM_RAM_BASE..SIM_RAM_BASE + SIM_RAM_SIZE as u64).contains(&a) {
                 out.push(state.ram[(a - SIM_RAM_BASE) as usize]);
-            } else if a >= SIM_FLASH_BASE && a < SIM_FLASH_BASE + 0x10000 {
+            } else if (SIM_FLASH_BASE..SIM_FLASH_BASE + 0x10000).contains(&a) {
                 // 模拟 flash：NOP 图样（0x00BF Thumb NOP）
-                out.push(if a % 2 == 0 { 0xBF } else { 0x00 });
+                out.push(if a.is_multiple_of(2) { 0xBF } else { 0x00 });
             } else {
                 out.push(0);
             }

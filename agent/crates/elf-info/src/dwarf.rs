@@ -93,7 +93,7 @@ pub(crate) fn index_dwarf<'a>(
             UnitSectionOffset::DebugInfoOffset(o) => o.0,
             UnitSectionOffset::DebugTypesOffset(o) => o.0,
         };
-        let end = start + unit.header.length_including_self() as usize;
+        let end = start + unit.header.length_including_self();
         unit_ranges.push((start, end));
         units.push(unit);
     }
@@ -119,6 +119,34 @@ pub(crate) fn index_dwarf<'a>(
                             (files.len() - 1) as u32
                         });
                         local_files.insert(idx, global);
+                    }
+                }
+                // V4-：file_index 0 是"编译单元主源文件"约定（文件表从 1 开始），
+                // 不映射则引用它的行被静默丢弃，line_for_addr 对这些 PC 返回 None
+                if header.version() < 5 {
+                    if let Some(cu_name) = unit.name {
+                        // unit.name 是 DW_AT_name 的原始 Reader（可能相对 comp_dir）
+                        let name = cu_name.to_string_lossy().into_owned();
+                        if !name.is_empty() {
+                            let path = if is_absolute(&name) {
+                                name
+                            } else {
+                                let mut parts: Vec<String> = unit
+                                    .comp_dir
+                                    .as_ref()
+                                    .map(|d| d.to_string_lossy().into_owned())
+                                    .into_iter()
+                                    .collect();
+                                parts.push(name);
+                                parts.join("/")
+                            };
+                            let path = crate::lexical_resolve(&path);
+                            let global = *file_key_cache.entry(path.clone()).or_insert_with(|| {
+                                files.push(path.clone());
+                                (files.len() - 1) as u32
+                            });
+                            local_files.insert(0, global);
+                        }
                     }
                 }
             }
@@ -224,15 +252,14 @@ pub(crate) fn index_dwarf<'a>(
                     }
 
                     // 嵌套结构体/类/联合体压入作用域栈（仅当有子 DIE 时）
-                    if tag != gimli::DW_TAG_typedef && tag != gimli::DW_TAG_enumeration_type {
-                        if entry.has_children() {
+                    if tag != gimli::DW_TAG_typedef && tag != gimli::DW_TAG_enumeration_type
+                        && entry.has_children() {
                             if let Some(ref name) = raw_name {
                                 if !name.is_empty() {
                                     scope_stack.push((depth, name.clone()));
                                 }
                             }
                         }
-                    }
                 }
                 gimli::DW_TAG_subprogram => {
                     let low_pc = match entry.attr_value(gimli::DW_AT_low_pc)? {
@@ -572,6 +599,7 @@ fn die_name_resolved<'a>(
 }
 
 /// 递归构建类型节点（地址为相对 0 的偏移，最后由外层 rebase）。
+#[allow(clippy::too_many_arguments)]
 fn build_type_node<'a>(
     dwarf: &Dwarf<R<'a>>,
     units: &[Unit<R<'a>>],
@@ -1035,6 +1063,7 @@ fn member_type_ref<'a>(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn collect_members<'a>(
     dwarf: &Dwarf<R<'a>>,
     units: &[Unit<R<'a>>],

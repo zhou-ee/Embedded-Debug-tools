@@ -43,6 +43,8 @@ class EmbeddedMonitorSettings : PersistentStateComponent<EmbeddedMonitorSettings
         var openocdPath: String = "",
         var scriptsDir: String = "",
         var tclPort: Int = 6666,
+        /** 探针序列号（多探针系统按 serial 选择）；空 = 第一个可用探针 */
+        var probeSerial: String = "",
         /** true = 只 attach 已运行的 OpenOCD（与 CLion 调试共存），不自行拉起 */
         var attachOnly: Boolean = true,
         /** 调试会话启动时自动开始监视（与调试器共存） */
@@ -83,6 +85,7 @@ class EmbeddedMonitorSettings : PersistentStateComponent<EmbeddedMonitorSettings
     val openocdPath: String get() = state.openocdPath
     val scriptsDir: String get() = state.scriptsDir
     val tclPort: Int get() = state.tclPort
+    val probeSerial: String get() = state.probeSerial
     val attachOnly: Boolean get() = state.attachOnly
     val autoStartWithDebug: Boolean get() = state.autoStartWithDebug
     val autoSwitchBackendOnDebug: Boolean get() = state.autoSwitchBackendOnDebug

@@ -434,13 +434,12 @@ fn test_watch_15hz_and_scope_simultaneous_eliminates_12hz_ceiling() {
     let deadline_10 = Instant::now() + Duration::from_millis(800);
     let mut count_10 = 0;
     while Instant::now() < deadline_10 {
-        if let Ok(ev) = rx.recv_timeout(Duration::from_millis(30)) {
-            if let Event::WatchData { values, .. } = ev {
-                if values.contains_key("live_val") {
-                    count_10 += 1;
-                }
+        if matches!(
+                rx.recv_timeout(Duration::from_millis(30)),
+                Ok(Event::WatchData { values, .. }) if values.contains_key("live_val")
+            ) {
+                count_10 += 1;
             }
-        }
     }
     assert!(
         (7..=9).contains(&count_10),
@@ -452,13 +451,12 @@ fn test_watch_15hz_and_scope_simultaneous_eliminates_12hz_ceiling() {
     let deadline_2 = Instant::now() + Duration::from_millis(800);
     let mut count_2 = 0;
     while Instant::now() < deadline_2 {
-        if let Ok(ev) = rx.recv_timeout(Duration::from_millis(30)) {
-            if let Event::WatchData { values, .. } = ev {
-                if values.contains_key("live_val") {
-                    count_2 += 1;
-                }
+        if matches!(
+                rx.recv_timeout(Duration::from_millis(30)),
+                Ok(Event::WatchData { values, .. }) if values.contains_key("live_val")
+            ) {
+                count_2 += 1;
             }
-        }
     }
     assert!(
         (1..=2).contains(&count_2),
@@ -502,13 +500,12 @@ fn test_watch_partial_failure_does_not_starve_valid_targets() {
     let deadline = Instant::now() + Duration::from_millis(600);
     let mut valid_count = 0;
     while Instant::now() < deadline {
-        if let Ok(ev) = rx.recv_timeout(Duration::from_millis(50)) {
-            if let Event::WatchData { values, .. } = ev {
-                if values.contains_key("valid_val") {
-                    valid_count += 1;
-                }
-            }
-        }
+        if matches!(
+                rx.recv_timeout(Duration::from_millis(50)),
+                Ok(Event::WatchData { values, .. }) if values.contains_key("valid_val")
+            ) {
+                valid_count += 1;
+            }    
     }
 
     assert!(
@@ -540,13 +537,12 @@ fn test_dynamic_watch_frequency_adjustment() {
     let start_15hz = Instant::now();
     let mut count_15hz = 0;
     while start_15hz.elapsed() < Duration::from_millis(800) {
-        if let Ok(ev) = rx.recv_timeout(Duration::from_millis(30)) {
-            if let Event::WatchData { values, .. } = ev {
-                if values.contains_key("var") {
-                    count_15hz += 1;
-                }
+        if matches!(
+                rx.recv_timeout(Duration::from_millis(30)),
+                Ok(Event::WatchData { values, .. }) if values.contains_key("var")
+            ) {
+                count_15hz += 1;
             }
-        }
     }
     assert!(count_15hz >= 8, "15Hz 在 800ms 内应至少收到 8 次采样，实得 {count_15hz} 次");
 
@@ -555,13 +551,12 @@ fn test_dynamic_watch_frequency_adjustment() {
     let start_2hz = Instant::now();
     let mut count_2hz = 0;
     while start_2hz.elapsed() < Duration::from_millis(800) {
-        if let Ok(ev) = rx.recv_timeout(Duration::from_millis(50)) {
-            if let Event::WatchData { values, .. } = ev {
-                if values.contains_key("var") {
-                    count_2hz += 1;
-                }
+        if matches!(
+                rx.recv_timeout(Duration::from_millis(50)),
+                Ok(Event::WatchData { values, .. }) if values.contains_key("var")
+            ) {
+                count_2hz += 1;
             }
-        }
     }
     assert!(
         (1..=3).contains(&count_2hz),
@@ -599,13 +594,12 @@ fn test_watch_frequency_protected_against_rapid_target_updates() {
             last_push = Instant::now();
         }
 
-        if let Ok(ev) = rx.recv_timeout(Duration::from_millis(10)) {
-            if let Event::WatchData { values, .. } = ev {
-                if values.contains_key("var") {
-                    count_watch += 1;
-                }
-            }
-        }
+        if matches!(
+                rx.recv_timeout(Duration::from_millis(10)),
+                Ok(Event::WatchData { values, .. }) if values.contains_key("var")
+            ) {
+                count_watch += 1;
+            }    
     }
 
     assert!(

@@ -27,7 +27,7 @@ fn main() {
         .unwrap_or(2_000_000);
     println!("SWD {speed} Hz");
 
-    let (mut probe, ident) = debug_core::probe::open_first_available().expect("探针");
+    let (mut probe, ident) = debug_core::probe::open_first_available(None).expect("探针");
     println!("探针 {ident}");
     let _ = probe.set_speed(speed / 1000);
     let mut session = probe

@@ -162,7 +162,7 @@ impl ElfIndex {
 
         // 变量按名称排序，地址 < 0x1000 的丢弃（对照原版）
         variables.retain(|v| v.address >= 0x1000);
-        variables.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+        variables.sort_by_key(|a| a.name.to_lowercase());
 
         // 展平地址索引
         let mut flat_addr_index = Vec::new();
@@ -404,6 +404,22 @@ pub fn normalize_path(p: &str) -> String {
     lexical_resolve(p).to_lowercase()
 }
 
+
+pub fn demangle(name: &str) -> String {
+    if name.starts_with("_Z") {
+        if let Ok(sym) = cpp_demangle::Symbol::new(name) {
+            let s = sym.to_string();
+            // GCC 双 ABI 后缀：剥掉 "[abi:cxx11]"，让 Watch 能按源码名（g_str）匹配
+            let trimmed = match s.find("[abi:") {
+                Some(i) => s[..i].trim_end().to_string(),
+                None => s,
+            };
+            return trimmed;
+        }
+    }
+    name.to_string()
+}
+
 #[cfg(test)]
 mod path_tests {
     use super::{lexical_resolve, normalize_path};
@@ -635,20 +651,4 @@ mod path_tests {
             panic!("Could not resolve g_ctx_alias.data[0].vx or [1].vx");
         }
     }
-}
-
-
-pub fn demangle(name: &str) -> String {
-    if name.starts_with("_Z") {
-        if let Ok(sym) = cpp_demangle::Symbol::new(name) {
-            let s = sym.to_string();
-            // GCC 双 ABI 后缀：剥掉 "[abi:cxx11]"，让 Watch 能按源码名（g_str）匹配
-            let trimmed = match s.find("[abi:") {
-                Some(i) => s[..i].trim_end().to_string(),
-                None => s,
-            };
-            return trimmed;
-        }
-    }
-    name.to_string()
 }

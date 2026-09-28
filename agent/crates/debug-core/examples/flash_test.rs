@@ -18,6 +18,7 @@ fn main() {
         speed,
         std::path::Path::new(&elf),
         debug_core::flash::FlashMode::Run,
+        None,
         |ev| match ev {
             debug_core::flash::FlashEvent::Log { text } => println!("[log] {text}"),
             debug_core::flash::FlashEvent::Progress { phase, percent } => {

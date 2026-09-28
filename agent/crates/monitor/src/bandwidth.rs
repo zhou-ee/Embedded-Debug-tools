@@ -41,7 +41,7 @@ pub fn merge_blocks(targets: &[(u64, u64)], freq_hz: f64) -> Vec<MemBlock> {
     for (addr, size) in sorted {
         // 兜底过滤：协议入口已校验 32 位范围，这里再防一道溢出/异常项，
         // 保证下面的地址算术（addr + size + 3）不会回绕
-        if size == 0 || addr.checked_add(size).map_or(true, |end| end > 0x1_0000_0000) {
+        if size == 0 || addr.checked_add(size).is_none_or(|end| end > 0x1_0000_0000) {
             continue;
         }
         let aligned_addr = addr & !3;
@@ -79,7 +79,7 @@ pub fn check_feasibility(targets: &[(u64, u64)], freq_hz: f64) -> (bool, u64) {
     let mut blocks: Vec<MemBlock> = Vec::new();
     for (addr, size) in sorted {
         // 兜底过滤：协议入口已校验 32 位范围，这里再防一道溢出/异常项
-        if size == 0 || addr.checked_add(size).map_or(true, |end| end > 0x1_0000_0000) {
+        if size == 0 || addr.checked_add(size).is_none_or(|end| end > 0x1_0000_0000) {
             continue;
         }
         match blocks.last_mut() {

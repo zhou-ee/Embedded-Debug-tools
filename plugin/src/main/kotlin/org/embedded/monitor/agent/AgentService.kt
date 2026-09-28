@@ -638,7 +638,7 @@ class AgentService(private val project: Project) : Disposable {
             if (session.isStopped) return@invokeLater
             val ui = session.ui
             if (ui == null) {
-                if (attempt < 10) {
+                if (attempt < 10 && !project.isDisposed) {
                     com.intellij.util.concurrency.AppExecutorUtil.getAppScheduledExecutorService().schedule({
                         registerLiveWatchDebugTab(session, attempt + 1)
                     }, 150, java.util.concurrent.TimeUnit.MILLISECONDS)
@@ -715,7 +715,7 @@ class AgentService(private val project: Project) : Disposable {
             if (session.isStopped) return@invokeLater
             val ui = session.ui
             if (ui == null) {
-                if (attempt < 10) {
+                if (attempt < 10 && !project.isDisposed) {
                     com.intellij.util.concurrency.AppExecutorUtil.getAppScheduledExecutorService().schedule({
                         registerRegisterDebugTab(session, attempt + 1)
                     }, 150, java.util.concurrent.TimeUnit.MILLISECONDS)
@@ -1153,6 +1153,10 @@ class AgentService(private val project: Project) : Disposable {
                         }
                         val n = vf.name.lowercase()
                         if (!n.endsWith(".elf") && !n.endsWith(".axf")) continue
+                        // 预筛：文件名不同则不可能与当前 ELF 同路径。canonicalPath 是
+                        // 磁盘 IO 且 VFS 刷新期可能回调在 EDT，仅文件名相同时才精确比较
+                        val sameName = current.endsWith("/$n", true) || current.endsWith("\$n", true)
+                        if (!sameName) continue
                         val same = runCatching {
                             java.io.File(vf.path).canonicalPath.equals(current, ignoreCase = true)
                         }.getOrDefault(false)
@@ -1396,6 +1400,7 @@ class AgentService(private val project: Project) : Disposable {
                 p.addProperty("speedHz", settings.speedHz)
                 p.addProperty("attachOnly", eff.attachOnly)
                 p.addProperty("tclPort", settings.tclPort)
+                settings.probeSerial.takeIf { it.isNotBlank() }?.let { p.addProperty("probeSerial", it) }
                 val resp = client.requestSync("connect", p, timeoutMs = 12000)
                 val ok = resp.get("ok")?.asBoolean ?: false
                 if (!ok) {
@@ -2138,7 +2143,13 @@ class AgentService(private val project: Project) : Disposable {
         }
     }
 
+    /** 当前下发的示波采样频率（带宽预警用） */
+    @Volatile var currentScopeFreqHz: Double = 100.0
+        private set
+
     fun setScopeFreq(freq: Double) {
+        currentScopeFreqHz = freq
+        scopeBandwidthWarned.set(false)
         val client = clientRef.get() ?: return
         ApplicationManager.getApplication().executeOnPooledThread {
             runCatching {
@@ -2435,6 +2446,45 @@ class AgentService(private val project: Project) : Disposable {
             runCatching {
                 client.requestSync("set_scope_targets", JsonObject().apply { add("targets", arr) }, 5000)
             }.onFailure { log.warn("set_scope_targets 失败", it) }
+            checkScopeBandwidth(arr)
+        }
+    }
+
+    /** 带宽预警标志：目标/频率变化时重置，同类告警只提示一次 */
+    private val scopeBandwidthWarned = java.util.concurrent.atomic.AtomicBoolean(false)
+
+    /**
+     * 示波速率可行性预警：连接目标/频率后询问 agent 的 check_bandwidth，
+     * 超出链路带宽时告知用户实际采样率达不到设定值（UI 已显示 actualRateHz，
+     * 此处补一个主动提示——之前用户设 10000Hz 实测只有 ~2700Hz 且无任何预警）。
+     */
+    private fun checkScopeBandwidth(arr: JsonArray) {
+        val client = clientRef.get() ?: return
+        if (arr.size() == 0) {
+            scopeBandwidthWarned.set(false)
+            return
+        }
+        val freq = currentScopeFreqHz
+        runCatching {
+            val resp = client.requestSync(
+                "check_bandwidth",
+                JsonObject().apply {
+                    add("targets", arr)
+                    addProperty("freq", freq)
+                },
+                5000,
+            )
+            val o = resp.get("result")?.takeIf { !it.isJsonNull }?.asJsonObject
+            val fits = o?.get("fits")?.asBoolean
+            if (fits == false && scopeBandwidthWarned.compareAndSet(false, true)) {
+                val bps = o.get("bytesPerSecond")?.asLong ?: -1L
+                notify(
+                    "示波器：当前 ${arr.size()} 通道 × ${freq.toInt()}Hz 超出探针链路带宽" +
+                        (if (bps > 0) "（实测约 ${"%.0f".format(bps / 1000.0)}KB/s）" else "") +
+                        "，实际采样率将低于设定值。可降低采样频率或减少通道。",
+                    com.intellij.notification.NotificationType.WARNING,
+                )
+            }
         }
     }
 

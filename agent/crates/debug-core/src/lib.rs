@@ -7,8 +7,10 @@
 
 use std::time::{Duration, Instant};
 
+/// 示波突发帧：[(自突发开始的耗时, 块数据列表)]
+pub type BurstFrames = Vec<(Duration, Vec<Vec<u8>>)>;
+
 pub mod flash;
-pub mod gdb_mi;
 pub mod openocd;
 #[cfg(windows)]
 pub mod openocd_job;
@@ -79,7 +81,7 @@ pub trait DebugBackend: Send {
         blocks: &[(u64, usize)],
         count: usize,
         interval: Duration,
-    ) -> Result<Vec<(Duration, Vec<Vec<u8>>)>, BackendError> {
+    ) -> Result<BurstFrames, BackendError> {
         let start = Instant::now();
         let mut out = Vec::with_capacity(count);
         for i in 0..count {

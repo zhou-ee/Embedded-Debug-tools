@@ -3,7 +3,7 @@
 > **路径映射说明**：V1.2.x 历史条目中的 `software_ref/` 对应本仓库现在的 `agent/`，
 > `package_release.py` 对应 `package.py`（项目在开源重构前为 software_ref 单体工程）。
 
-## [V1.2.18] — CLion 原生 GDB 求值接入（复杂表达式断点期求值）
+## [V1.2.18] — CLion 原生 GDB 求值接入（复杂表达式断点期求值）+ 审查遗留修复批次
 
 ### Plugin (V1.2.18)
 - **新增"CLion 求值型"监视项**：无法解析为内存地址的复杂 C 表达式（强转、函数调用等）
@@ -14,6 +14,35 @@
 - **持久化兼容**：`PersistedWatchItem` 新增 `evalOnly` 属性，旧配置缺省 false 向后兼容；
   树节点以 `⟦CLion 求值⟧` 标记 + 求值专用图标区分于内存读取型项；
 - 会话结束自动清空求值器引用；求值结果经 `XValueNode` 捕获（同步/异步 presentation 均支持）。
+
+### Agent（v1.2.18）
+- **退役休眠 GDB 求值链路**：原版单体应用（无 IDE）需要自带 gdb_evaluator，移植插件后
+  `ConfigureGdb`/`UpdateExprTargets` 始终无调用方；求值职责已由插件的 CLion 原生求值器
+  接管——整体删除 `gdb_mi.rs`/`eval_expressions`/`ExprTarget`/`Event::ExprData`（含 V1.2.17
+  的异步预热加固），二进制缩小约 60KB；
+- **探针 serial 选择**：`ConnectParams` 新增 `probeSerial`（协议可选字段），`open_first_available`
+  支持按序列号过滤，probe-rs 后端与 flash 路径均透传——多探针系统不再"盲选第一个能打开的"，
+  杜绝监视/烧录误连别家设备；插件设置页新增探针序列号输入（留空 = 第一个可用）；
+- **握手拒绝不再杀死 agent**：误连/端口扫描的失败会话回到 accept 继续等待真实客户端
+  （插件连接已在 backlog 排队），不再让插件拿到"已死"的 agent；accept 自身失败重试 10s；
+- **示波带宽主动预警**：目标/频率下发时调用 `check_bandwidth`，超出链路带宽提示实际采样率
+  将低于设定值（此前 UI 设 10000Hz 实测只有 ~2700Hz 且无任何预警）；
+- **DWARF V4- 行表补全**：`file_index==0`（编译单元主源文件约定）不再被静默丢弃，
+  回退映射到 CU 名；
+- **`reset halt` 慢命令超时分级**：读超时临时放宽到 10s（默认 2.5s 对带看门狗/慢时钟目标
+  会误判连接丢失拆流重建）；
+- **杂项**：未使用依赖清理（workspace anyhow、embedded-clion-agent serde、monitor/elf-info
+  tracing）；`BurstFrames` 类型别名；clippy 全量清零（`-D warnings` 门禁通过）。
+
+### CI / 工程
+- agent 任务新增 `cargo clippy --workspace --all-targets --locked -- -D warnings` 门禁；
+- 插件任务新增 `gradlew verifyPlugin`（对 pinned CLion 2026.2.2 校验 API 兼容性）；
+- `package.py` 新增插件↔agent 版本联动断言（不一致直接拒绝打包）；
+- `release.yml` 改为 draft 发布：先上传产物确认无误再 publish，不再留下空 Release。
+
+### 真机验证（STM32G431CBTx + Flash Pro CMSIS-DAP）
+- `test_hw_e2e` 24 项 ALL PASS（负向用例升级：验证"拒绝后保持存活 + 真实客户端 backlog 接入"）；
+- sim 冒烟 ALL PASS；cargo test 46/0；clippy `-D warnings` 零告警；gradle test 124/0。
 
 ## [V1.2.17] — 只读审查修复批次：正确性、进程生命周期与 EDT 纪律
 
