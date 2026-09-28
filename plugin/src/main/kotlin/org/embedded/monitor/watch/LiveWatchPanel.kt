@@ -356,6 +356,11 @@ class LiveWatchTreeCellRenderer @JvmOverloads constructor(
         val typeDisplay = treeNode.typeName
         colored.append("{$typeDisplay}", SimpleTextAttributes.GRAY_ATTRIBUTES)
 
+        // 指针节点显示当前指向:g_chassis_ptr._ctx.* 与 g_chassis_ctx_ptr.* 这类同名成员子树一眼可辨
+        if (treeNode.isPointer && (treeNode.pointerAddress ?: 0L) >= 0x1000L) {
+            colored.append("  → 0x%08X".format(Locale.ROOT, treeNode.pointerAddress), SimpleTextAttributes.GRAYED_ATTRIBUTES)
+        }
+
         if (treeNode.isNullPtr) {
             colored.append(" <nullptr>", SimpleTextAttributes.GRAY_ATTRIBUTES)
         } else if (!treeNode.isComposite || treeNode.isPointer) {
@@ -1176,7 +1181,12 @@ class LiveWatchPanel(private val project: Project) :
                     if (added == null) {
                         service.notify("该地址已在示波通道列表中", com.intellij.notification.NotificationType.INFORMATION)
                     } else {
-                        service.notify("已添加「$label」到示波器", com.intellij.notification.NotificationType.INFORMATION)
+                        // 通知必须携带解析出的绝对地址：g_chassis_ptr._ctx.seq 与
+                        // g_chassis_ctx_ptr.seq 这类同名子树的通道只有靠地址才能一眼区分
+                        service.notify(
+                            "已添加「$label」@ 0x%08X 到示波器".format(Locale.ROOT, physicalAddr),
+                            com.intellij.notification.NotificationType.INFORMATION,
+                        )
                     }
                 }
             })

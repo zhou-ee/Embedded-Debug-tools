@@ -5,7 +5,7 @@
 **专为 JetBrains CLion 打造的嵌入式高速无干扰实时变量监视（Live Variable Watch）、实时示波器（Oscilloscope）与外设寄存器实时监视（Register Live Watch）调试套件。**
 
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
-[![CLion](https://img.shields.io/badge/CLion-2024.3%2B-green.svg)](https://www.jetbrains.com/clion/)
+[![CLion](https://img.shields.io/badge/CLion-2026.2%2B-green.svg)](https://www.jetbrains.com/clion/)
 [![Rust](https://img.shields.io/badge/Rust-Stable-orange.svg)](https://www.rust-lang.org/)
 [![Kotlin](https://img.shields.io/badge/Kotlin-2.0%2B-purple.svg)](https://kotlinlang.org/)
 [![Platform](https://img.shields.io/badge/Platform-Windows%20%20(Linux%20%7C%20macOS%EF%BC%9A%E9%9C%80%E8%87%AA%E8%A1%8C%E7%BC%96%E8%AF%91%20Agent)-lightgrey.svg)]()

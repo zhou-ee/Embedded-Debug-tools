@@ -5,7 +5,7 @@
 **High-speed, non-intrusive real-time memory monitoring, oscilloscope waveforms, and peripheral register live watch for embedded systems in JetBrains CLion.**
 
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
-[![CLion](https://img.shields.io/badge/CLion-2024.3%2B-green.svg)](https://www.jetbrains.com/clion/)
+[![CLion](https://img.shields.io/badge/CLion-2026.2%2B-green.svg)](https://www.jetbrains.com/clion/)
 [![Rust](https://img.shields.io/badge/Rust-Stable-orange.svg)](https://www.rust-lang.org/)
 [![Kotlin](https://img.shields.io/badge/Kotlin-2.0%2B-purple.svg)](https://kotlinlang.org/)
 [![Platform](https://img.shields.io/badge/Platform-Windows%20%20(Linux%20%7C%20macOS%3A%20build%20agent%20from%20source)-lightgrey.svg)]()

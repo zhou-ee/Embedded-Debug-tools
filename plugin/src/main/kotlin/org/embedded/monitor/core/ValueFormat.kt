@@ -20,11 +20,13 @@ enum class ValueFormat {
     fun decode(bytes: ByteArray): Float = SampleDecoder.decode(this, bytes)
 
     companion object {
-        /** 按字节宽推断默认格式；未知宽度回退 I32。 */
+        /** 按字节宽推断默认格式；未知宽度回退 I32。
+         *  4 字节默认 I32 而非 F32：缺省路径多见于整型全局，按 F32 位重解释会把
+         *  int32 读成 ≈1e-41 的非规格化数、曲线贴 0；真浮点通道必须显式携带 encoding。 */
         fun inferFromSize(size: Int): ValueFormat = when {
             size <= 1 -> U8
             size == 2 -> I16
-            size == 4 -> F32
+            size == 4 -> I32
             size >= 8 -> F64
             else -> I32
         }
