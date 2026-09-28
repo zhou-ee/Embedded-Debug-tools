@@ -25,7 +25,16 @@ object OpenOcdConfigReader {
 
     fun readAll(project: Project): List<OpenOcdRunConfig> {
         val configs = ArrayList<OpenOcdRunConfig>()
-        val saxBuilder = SAXBuilder()
+        val saxBuilder = SAXBuilder().apply {
+            // 解析的是工程内 XML（.idea/workspace.xml / runConfigurations），统一禁 DTD
+            // 与外部实体，与 SvdParser 的加固策略一致
+            runCatching {
+                setFeature("http://apache.org/xml/features/disallow-doctype-decl", true)
+                setFeature("http://xml.org/sax/features/external-general-entities", false)
+                setFeature("http://xml.org/sax/features/external-parameter-entities", false)
+                setFeature(javax.xml.XMLConstants.FEATURE_SECURE_PROCESSING, true)
+            }
+        }
 
         // 1. 读取 .idea/workspace.xml
         workspaceXml(project)?.let { ws ->

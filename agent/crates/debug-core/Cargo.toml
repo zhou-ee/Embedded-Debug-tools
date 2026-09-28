@@ -10,3 +10,6 @@ thiserror.workspace = true
 tracing.workspace = true
 parking_lot.workspace = true
 probe-rs = "0.31"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading"] }

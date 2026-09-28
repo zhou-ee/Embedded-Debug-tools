@@ -5,10 +5,10 @@
 **High-speed, non-intrusive real-time memory monitoring, oscilloscope waveforms, and peripheral register live watch for embedded systems in JetBrains CLion.**
 
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
-[![CLion](https://img.shields.io/badge/CLion-2024.2%20%7C%202026.x-green.svg)](https://www.jetbrains.com/clion/)
-[![Rust](https://img.shields.io/badge/Rust-1.75%2B-orange.svg)](https://www.rust-lang.org/)
+[![CLion](https://img.shields.io/badge/CLion-2024.3%2B-green.svg)](https://www.jetbrains.com/clion/)
+[![Rust](https://img.shields.io/badge/Rust-Stable-orange.svg)](https://www.rust-lang.org/)
 [![Kotlin](https://img.shields.io/badge/Kotlin-2.0%2B-purple.svg)](https://kotlinlang.org/)
-[![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey.svg)]()
+[![Platform](https://img.shields.io/badge/Platform-Windows%20%20(Linux%20%7C%20macOS%3A%20build%20agent%20from%20source)-lightgrey.svg)]()
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](CONTRIBUTING.md)
 
 [**中文文档 (简体中文)**](README_CN.md) | [**Release Notes**](CHANGELOG.md) | [**Architecture Guide**](HANDOVER.md)
@@ -53,7 +53,7 @@ Embedded Debug Tools adopts a modular **Monorepo architecture** separating the I
                       +---------------------------------------+
                                          |
                                          | JSON-RPC over TCP
-                                         | (localhost:44445)
+                                         | (localhost, ephemeral port)
                                          v
                       +---------------------------------------+
                       |    embedded-clion-agent (Rust Daemon) |
@@ -111,12 +111,12 @@ Embedded Debug tools/
 1. Download `embedded-debug-plugin-V1.2.14-standalone.zip` from [Releases](../../releases).
 2. In CLion, navigate to **Settings** (`Ctrl+Alt+S`) -> **Plugins** -> ⚙️ -> **Install Plugin from Disk...**.
 3. Select the downloaded `.zip` file and restart CLion.
-4. *Note: Standalone package bundles the native `embedded-clion-agent` executable—no external Rust installation needed!*
+4. *Note: Standalone package bundles the native `embedded-clion-agent` executable—no external Rust installation needed! The bundled agent binary is currently Windows-only; Linux/macOS users should build the agent from source (Option 2).*
 
 ### Option 2: Build from Source
 #### Prerequisites
 - **JDK 17** or **JDK 21** (or CLion's bundled JBR: `<CLion_Installation>/jbr`)
-- **Rust Stable 1.75+** (`cargo` on PATH)
+- **Rust Stable** (latest stable toolchain, `cargo` on PATH)
 - **Python 3.8+**
 
 #### One-Click Build & Packaging

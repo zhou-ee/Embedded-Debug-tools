@@ -32,7 +32,7 @@ Embedded Debug tools/
 To develop, build, and test this project, you need:
 
 1. **Rust Toolchain**:
-   - Rust 1.75+ (stable)
+   - Rust stable (latest stable toolchain)
    - `cargo` available on `PATH`
 2. **Java / JVM Environment**:
    - JDK 17 or JDK 21 (or JetBrains Runtime `jbr`)
@@ -40,7 +40,7 @@ To develop, build, and test this project, you need:
 3. **Python**:
    - Python 3.8+ (for `build.py` and `package.py`)
 4. **JetBrains CLion**:
-   - CLion 2024.2+ or 2026.x
+   - CLion 2024.3+ (the build is pinned to CLion 2024.3 by default; set `CLION_HOME` to use a local IDE)
 5. **Hardware Debugger (Optional, for physical hardware testing)**:
    - CMSIS-DAP / DAP-Link / ST-Link / J-Link
    - OpenOCD 0.12+ (configured with Tcl RPC enabled on port 6666)

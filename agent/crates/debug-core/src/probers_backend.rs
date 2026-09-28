@@ -9,6 +9,38 @@ use crate::{BackendError, DebugBackend};
 /// 单次失败按瞬时错误处理（该方法每次都会重新 attach 访问端口，失败未必是断线）。
 const CORE_FAIL_STREAK_LIMIT: u32 = 5;
 
+/// 校验 [addr, addr+len) 落在可访问范围内（读/写共用）。
+/// - 地址不在任何已映射区域/白名单内 → Err（越界访问会把探针留在 FAULT 态）；
+/// - 请求跨出区域末尾 → Err（截断会让上层拿到"短了却当完整"的数据）。
+fn checked_access_len(core: &probe_rs::Core, addr: u64, len: usize) -> Result<usize, BackendError> {
+    let limit = if let Some(r) = core.memory_regions().find(|r| r.contains(addr)) {
+        Some(r.address_range().end)
+    } else if (PPB_LO..PPB_HI).contains(&addr) {
+        // PPB / SCS（调试寄存器区）不在 target 的 memory_regions 里，但必须可访问
+        Some(PPB_HI)
+    } else if (PERIPH_LO..PERIPH_HI).contains(&addr) {
+        // 外设寄存器区（MMIO，SVD 读寄存器）
+        Some(PERIPH_HI)
+    } else if (EXT_RAM_LO..EXT_RAM_HI).contains(&addr) {
+        // 外扩设备 / RAM 区（FMC/FSMC）
+        Some(EXT_RAM_HI)
+    } else {
+        None
+    };
+    let Some(limit) = limit else {
+        return Err(BackendError::Transfer(format!(
+            "地址 0x{addr:08x} 不在任何已映射内存区域内，已拒绝下发（越界访问会让探针进故障态）"
+        )));
+    };
+    let avail = (limit - addr) as usize;
+    if len > avail {
+        return Err(BackendError::Transfer(format!(
+            "访问请求 0x{addr:08x}+{len}B 跨出区域末尾（上界 0x{limit:08x}），已拒绝下发"
+        )));
+    }
+    Ok(len)
+}
+
 /// PPB / SCS（调试寄存器区）：不在 target 的 memory_regions 里，但必须允许访问
 const PPB_LO: u64 = 0xE000_0000;
 const PPB_HI: u64 = 0xE010_0000;
@@ -143,31 +175,15 @@ impl DebugBackend for ProbeRsBackend {
 
     fn read_bytes(&mut self, addr: u64, len: usize) -> Result<Vec<u8>, BackendError> {
         let mut core = self.core()?;
-        // 长度按"所在区域上界"截断；**地址不在任何区域内时拒绝下发**。
+        // **地址不在任何区域内时拒绝下发**，请求跨出区域末尾时显式报错。
         //
         // 越界访问不会干净地返回错误：实测 G431 + CMSIS-DAP 克隆，读一次 SRAM 之外
         // 的地址会让目标回 FAULT 响应，**把访问端口留在故障态** —— 之后连
         // `session.core()` 都失败（Arm(Dap(FaultResponse))），引擎遂判"连接丢失"，
         // 断线重连后又触发同样的越界读，形成无限重连。
-        // 调用方（栈扫描 / 调用栈回溯 / STL 展开 / SVD）本就是"读失败即停止或缩短"
-        // 的语义，返回干净的 Transfer 错误即可，绝不能真的把访问发出去。
-        let len = match core.memory_regions().find(|r| r.contains(addr)) {
-            Some(r) => {
-                let avail = (r.address_range().end - addr) as usize;
-                len.min(avail)
-            }
-            // PPB / SCS（调试寄存器区）不在 target 的 memory_regions 里，但必须可访问
-            None if (PPB_LO..PPB_HI).contains(&addr) => len,
-            // 外设寄存器区（MMIO，SVD 读寄存器）
-            None if (PERIPH_LO..PERIPH_HI).contains(&addr) => len,
-            // 外扩设备 / RAM 区（FMC/FSMC）
-            None if (EXT_RAM_LO..EXT_RAM_HI).contains(&addr) => len,
-            None => {
-                return Err(BackendError::Transfer(format!(
-                    "地址 0x{addr:08x} 不在任何已映射内存区域内，已拒绝下发（越界访问会让探针进故障态）"
-                )))
-            }
-        };
+        // 跨界静默截断同样有害：上层会拿"短了却当完整"的缓冲继续解码（如
+        // conditions::decode_scalar 按实际短长度解出错误数值），宁可显式失败。
+        let len = checked_access_len(&core, addr, len)?;
         if len == 0 {
             return Ok(Vec::new());
         }
@@ -188,6 +204,8 @@ impl DebugBackend for ProbeRsBackend {
 
     fn write_bytes(&mut self, addr: u64, data: &[u8]) -> Result<(), BackendError> {
         let mut core = self.core()?;
+        // 写路径与读路径同源校验：越界写同样会把探针留在 FAULT 态且可能写坏目标
+        checked_access_len(&core, addr, data.len())?;
         core.write_8(addr, data).map_err(Self::map_err)?;
         Ok(())
     }

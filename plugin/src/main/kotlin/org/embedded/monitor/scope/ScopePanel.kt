@@ -902,16 +902,35 @@ class ScopePanel(private val project: Project) : JBPanel<ScopePanel>(BorderLayou
         return if (v.isNaN()) null else v
     }
 
+    // 全量快照克隆的在飞标记：30Hz 拉取 × 版本变化即全量 clone（50k×通道数），
+    // 必须挪出 EDT 且防重入堆积
+    private val snapshotInFlight = java.util.concurrent.atomic.AtomicBoolean(false)
+
     private fun refreshWaveform() {
+        // 工具窗隐藏时跳过轮询（定时器仅在面板可见时有意义）
+        if (!isShowing()) return
         val state = service.engineState
         waveform.setSampleRate(service.actualRateHz)
-        waveform.setFrame(service.scopeSnapshot(), service.scopeVariables.toList())
+        if (snapshotInFlight.compareAndSet(false, true)) {
+            com.intellij.openapi.application.ApplicationManager.getApplication().executeOnPooledThread {
+                try {
+                    val snap = service.scopeSnapshot()
+                    val vars = service.scopeVariables.toList()
+                    com.intellij.util.ui.UIUtil.invokeLaterIfNeeded {
+                        waveform.setFrame(snap, vars)
+                    }
+                } finally {
+                    snapshotInFlight.set(false)
+                }
+            }
+        }
 
         startButton.isEnabled = state != "running" && state != "connecting" && state != "halted"
         stopButton.isEnabled = state == "running" || state == "halted" || state == "connecting"
     }
 
     private fun refreshMetrics() {
+        if (!isShowing()) return
         val state = service.engineState
         val actualHz = service.actualRateHz
         val bufSpan = service.scopeBufferSpanSec()
@@ -946,6 +965,7 @@ class ScopePanel(private val project: Project) : JBPanel<ScopePanel>(BorderLayou
     }
 
     private fun refreshTable() {
+        if (!isShowing()) return
         val vars = service.scopeVariables.toList()
         val lastValues = service.scopeLastValues()
         tableModel.update(vars, lastValues)
@@ -956,6 +976,8 @@ class ScopePanel(private val project: Project) : JBPanel<ScopePanel>(BorderLayou
         refreshTimer.stop()
         metricsTimer.stop()
         tableTimer.stop()
+        // 波形画布内部还有自己的 33ms repaintTimer，不在此停会泄漏整个组件图
+        waveform.stopRepaintTimer()
     }
 
     companion object {

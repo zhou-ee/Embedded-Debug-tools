@@ -42,6 +42,8 @@ class AddToScopeAction : AnAction() {
             val added = AgentService.getInstance(project)
                 .addScopeVariable(item.expr, item.address, item.size, item.encoding)
             if (added == null) {
+                // 地址已是示波通道：回收本次为解析地址而添加的 watch，避免列表残留
+                AgentService.getInstance(project).removeWatch(item.id)
                 AgentService.getInstance(project).notify("该地址已在示波通道列表中。", com.intellij.notification.NotificationType.INFORMATION)
             }
         }

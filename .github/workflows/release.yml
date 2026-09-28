@@ -1,0 +1,51 @@
+name: Release
+
+# 推送 v* tag 时自动产出发布包：CI 验证的与发布的是同一条流水线、同一构建配置
+# （此前发布完全依赖本机手工跑 package.py，README 引导用户下载的 Releases 实际无人生产）
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  release:
+    name: Build & Publish Release
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "agent -> agent/target"
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'zulu'
+          java-version: '21'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Package (agent + plugin + standalone zip)
+        run: python package.py
+
+      - name: Generate SHA256
+        shell: pwsh
+        run: |
+          Get-ChildItem release/*.zip | ForEach-Object {
+            $h = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower()
+            "$h  $($_.Name)" | Out-File -FilePath "$($_.FullName).sha256" -Encoding ascii
+          }
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$env:GITHUB_REF_NAME" --title "$env:GITHUB_REF_NAME" --generate-notes
+          gh release upload "$env:GITHUB_REF_NAME" release/*.zip release/*.sha256

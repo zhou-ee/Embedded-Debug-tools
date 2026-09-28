@@ -13,7 +13,7 @@ use debug_core::{BackendKind, ConnectParams, TargetState};
 use monitor::{bandwidth, Command, Event, MemTarget, MonitorHandle, ScopeTarget};
 use parking_lot::Mutex;
 use serde_json::{json, Value};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -22,6 +22,11 @@ use std::time::Duration;
 /// 同步读内存的超时与上限（对齐 src-tauri 的 monitor_read_mem）
 const READ_MEM_TIMEOUT: Duration = Duration::from_secs(2);
 const READ_MEM_MAX: usize = 64 * 1024;
+/// 单行请求长度上限：超限视为协议错误并断开。elf_load 的变量树下发由
+/// agent → 插件方向承载，上行请求（targets 列表等）远小于此值
+const MAX_LINE_LEN: usize = 4 * 1024 * 1024;
+/// 引擎收尾（清 DWT/断点、resume、断开 probe）的等待上限
+const ENGINE_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 
 pub struct SharedState {
     /// 最近已知目标状态
@@ -32,8 +37,12 @@ pub struct SharedState {
 pub struct Session {
     writer: Sender<String>,
     shared: Arc<SharedState>,
+    /// 连接令牌（main 生成、经就绪行交给插件，hello 握手校验）
+    token: String,
     /// 当前引擎的命令通道（None = 引擎未启动/已关闭）
     cmd_slot: Mutex<Option<Sender<Command>>>,
+    /// 引擎事件泵线程句柄：shutdown 时 join，保证引擎硬件收尾执行完再退进程
+    pump_join: Mutex<Option<std::thread::JoinHandle<()>>>,
     watch_freq: Mutex<Option<f64>>,
     scope_freq: Mutex<Option<f64>>,
     watch_targets: Mutex<Option<Vec<MemTarget>>>,
@@ -41,14 +50,16 @@ pub struct Session {
 }
 
 impl Session {
-    pub fn new(writer: Sender<String>) -> Self {
+    pub fn new(writer: Sender<String>, token: String) -> Self {
         Self {
             writer,
             shared: Arc::new(SharedState {
                 target_state: Mutex::new(TargetState::Disconnected),
                 elf_cache: ElfCache::default(),
             }),
+            token,
             cmd_slot: Mutex::new(None),
+            pump_join: Mutex::new(None),
             watch_freq: Mutex::new(None),
             scope_freq: Mutex::new(None),
             watch_targets: Mutex::new(None),
@@ -58,18 +69,21 @@ impl Session {
 
     /// connect：关闭旧引擎，重启新引擎并派泵线程（对齐 src-tauri monitor_start 行为）。
     fn engine_connect(&self, params: ConnectParams) {
+        // 先等旧引擎完全收尾（shutdown_engine 内 join 泵线程），避免新旧引擎
+        // 短暂并存抢占同一 USB probe
         self.shutdown_engine();
         let handle = monitor::spawn_engine();
         let cmd_tx = handle.cmd_tx.clone();
         *self.cmd_slot.lock() = Some(cmd_tx.clone());
         let writer = self.writer.clone();
         let shared = self.shared.clone();
-        std::thread::Builder::new()
+        let pump = std::thread::Builder::new()
             .name("agent-event-pump".into())
             .spawn(move || {
                 pump_loop(handle, &writer, &shared);
             })
             .expect("spawn event pump");
+        *self.pump_join.lock() = Some(pump);
         if let Some(freq) = *self.watch_freq.lock() {
             let _ = cmd_tx.send(Command::SetWatchFreq(freq));
         }
@@ -88,13 +102,74 @@ impl Session {
     pub fn shutdown_engine(&self) {
         if let Some(cmd_tx) = self.cmd_slot.lock().take() {
             let _ = cmd_tx.send(Command::Shutdown);
-            // 引擎线程退出 → 事件通道关闭 → 泵线程随之退出并 Drop MonitorHandle
+        }
+        // 关键：等泵线程退出。泵线程 Drop MonitorHandle 时会 join 引擎线程，
+        // 引擎 run() 末尾才会清 DWT 比较器/断点并 resume 目标——若不等它，
+        // 进程立即退出会把清理路径整段杀掉，目标板被遗留断点/停机态污染
+        let join = self.pump_join.lock().take();
+        if let Some(handle) = join {
+            let deadline = std::time::Instant::now() + ENGINE_SHUTDOWN_TIMEOUT;
+            while !handle.is_finished() && std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            if handle.is_finished() {
+                let _ = handle.join();
+            } else {
+                eprintln!(
+                    "[agent] 引擎收尾等待超时（{:?}），放弃等待（可能遗留 DWT/断点配置）",
+                    ENGINE_SHUTDOWN_TIMEOUT
+                );
+            }
         }
     }
 
-    pub fn run(&self, reader: BufReader<TcpStream>) {
-        for line in reader.lines() {
-            let Ok(line) = line else { break };
+    pub fn run(&self, mut reader: BufReader<TcpStream>) {
+        // 握手：第一条消息必须是携带正确 token 的 hello（防本机其它进程扫端口操控硬件）
+        let mut first = String::new();
+        match read_line_limited(&mut reader, &mut first) {
+            Ok(0) => return,
+            Ok(_) => {}
+            Err(e) => {
+                eprintln!("[agent] 握手读取失败: {e}");
+                return;
+            }
+        }
+        let parsed = parse_request(first.trim()).ok();
+        let hello_ok = parsed.as_ref().and_then(|req| {
+            if req.method != "hello" {
+                return None;
+            }
+            req.params.get("token").and_then(Value::as_str).map(|t| t == self.token)
+        }) == Some(true);
+        if !hello_ok {
+            eprintln!("[agent] 握手失败（缺少 hello 或 token 不匹配），断开连接");
+            // 回显请求 id，让调用方能把错误关联回 hello
+            let id = parsed.as_ref().map(|r| r.id).unwrap_or(0);
+            let _ = self
+                .writer
+                .send(response_err(id, "握手失败：第一条消息必须是携带正确 token 的 hello（插件与 agent 版本需一致）"));
+            return;
+        }
+        // hello 是请求：回标准响应（含协议版本），供调用方同步确认握手成功
+        let _ = self.writer.send(response_ok(
+            parsed.as_ref().map(|r| r.id).unwrap_or(0),
+            json!({"proto": crate::PROTOCOL_VERSION, "name": "embedded-clion-agent", "version": env!("CARGO_PKG_VERSION")}),
+        ));
+
+        loop {
+            let mut line = String::new();
+            match read_line_limited(&mut reader, &mut line) {
+                Ok(0) => break,
+                Ok(_) => {}
+                Err(e) => {
+                    eprintln!("[agent] 读取失败（{e}），断开连接");
+                    break;
+                }
+            }
+            if line.len() > MAX_LINE_LEN {
+                eprintln!("[agent] 单行请求超长（>{} 字节），断开连接", MAX_LINE_LEN);
+                break;
+            }
             eprintln!("[agent] recv: {}", line.trim().chars().take(80).collect::<String>());
             let line = line.trim().to_string();
             if line.is_empty() {
@@ -103,7 +178,12 @@ impl Session {
             let req = match parse_request(&line) {
                 Ok(r) => r,
                 Err(e) => {
-                    let _ = self.writer.send(response_err(0, e));
+                    // 尽力提取 id，让插件能把错误关联回请求
+                    let id = serde_json::from_str::<Value>(&line)
+                        .ok()
+                        .and_then(|v| v.get("id").and_then(Value::as_u64))
+                        .unwrap_or(0);
+                    let _ = self.writer.send(response_err(id, e));
                     continue;
                 }
             };
@@ -159,6 +239,9 @@ impl Session {
                     p.get("targets").cloned().unwrap_or(Value::Array(vec![])),
                 )
                 .map_err(|e| format!("targets 解析失败: {e}"))?;
+                for t in &targets {
+                    validate_mem_range(t.addr, t.size as u64)?;
+                }
                 *self.watch_targets.lock() = Some(targets.clone());
                 let _ = self.send_cmd(Command::UpdateWatchTargets(targets));
                 self.send(response_ok(id, Value::Null));
@@ -168,6 +251,9 @@ impl Session {
                     p.get("targets").cloned().unwrap_or(Value::Array(vec![])),
                 )
                 .map_err(|e| format!("targets 解析失败: {e}"))?;
+                for t in &targets {
+                    validate_mem_range(t.addr, t.size as u64)?;
+                }
                 *self.scope_targets.lock() = Some(targets.clone());
                 let _ = self.send_cmd(Command::UpdateScopeTargets(targets));
                 self.send(response_ok(id, Value::Null));
@@ -190,6 +276,7 @@ impl Session {
                 if size == 0 || size > READ_MEM_MAX {
                     return Err(format!("size 超出范围 1..{READ_MEM_MAX}"));
                 }
+                validate_mem_range(addr, size as u64)?;
                 self.read_mem_sync(id, addr, size)?;
             }
             "write_mem" => {
@@ -197,6 +284,10 @@ impl Session {
                 let data: Vec<u8> =
                     serde_json::from_value(p.get("data").cloned().ok_or("缺少 data")?)
                         .map_err(|e| format!("data 解析失败: {e}"))?;
+                if data.len() > READ_MEM_MAX {
+                    return Err(format!("data 超出上限 {READ_MEM_MAX} 字节"));
+                }
+                validate_mem_range(addr, data.len() as u64)?;
                 self.send_cmd(Command::WriteMem { addr, data })?;
                 self.send(response_ok(id, Value::Null));
             }
@@ -205,6 +296,9 @@ impl Session {
                     p.get("targets").cloned().ok_or("缺少 targets")?,
                 )
                 .map_err(|e| format!("targets 解析失败（需 [[addr,size],..]）: {e}"))?;
+                for (addr, size) in &targets {
+                    validate_mem_range(*addr, *size)?;
+                }
                 let freq = p.get("freq").and_then(Value::as_f64).ok_or("缺少 freq")?;
                 let (fits, bytes_per_second) = bandwidth::check_feasibility(&targets, freq);
                 self.send(response_ok(
@@ -344,10 +438,61 @@ fn parse_connect_params(p: &Value) -> Result<ConnectParams, String> {
         cfg_file: p.get("cfgFile").and_then(Value::as_str).map(str::to_string),
         openocd_path: p.get("openocdPath").and_then(Value::as_str).map(str::to_string),
         scripts_dir: p.get("scriptsDir").and_then(Value::as_str).map(str::to_string),
-        speed_hz: p.get("speedHz").and_then(Value::as_u64).unwrap_or(4_000_000) as u32,
+        // 静默截断会把 70000kHz 之类参数悄悄变成另一个值，超范围直接报错
+        speed_hz: u32::try_from(p.get("speedHz").and_then(Value::as_u64).unwrap_or(4_000_000))
+            .map_err(|_| "speedHz 超出 u32 范围")?,
         attach_only: p.get("attachOnly").and_then(Value::as_bool).unwrap_or(false),
-        tcl_port: p.get("tclPort").and_then(Value::as_u64).unwrap_or(6666) as u16,
+        tcl_port: u16::try_from(p.get("tclPort").and_then(Value::as_u64).unwrap_or(6666))
+            .map_err(|_| "tclPort 超出 u16 范围")?,
     })
+}
+
+/// 所有来自 JSON 的 addr/size 统一在协议入口校验：Cortex-M 为 32 位地址空间，
+/// 超范围请求在下游无 checked 算术处会溢出（debug panic 杀引擎线程 / release
+/// 回绕产生巨型读块导致巨量分配 abort）
+fn validate_mem_range(addr: u64, size: u64) -> Result<(), String> {
+    if size == 0 {
+        return Err("size 必须为正".into());
+    }
+    match addr.checked_add(size) {
+        Some(end) if end <= 0x1_0000_0000 => Ok(()),
+        _ => Err(format!(
+            "地址范围 0x{addr:x}+0x{size:x} 超出 32 位地址空间"
+        )),
+    }
+}
+
+/// 连接令牌：RandomState 每实例带 OS 熵种子，双 hasher 拼 128 位，
+/// 足以抵御本机其它用户的进程对临时端口的盲扫（无加密需求）
+pub fn generate_token() -> String {
+    use std::hash::{BuildHasher, Hasher};
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let mut h1 = std::collections::hash_map::RandomState::new().build_hasher();
+    let mut h2 = std::collections::hash_map::RandomState::new().build_hasher();
+    h1.write_u64(nanos as u64);
+    h1.write_u64((nanos >> 64) as u64);
+    h1.write_u64(std::process::id() as u64);
+    h2.write_u64((nanos as u64).rotate_left(17));
+    h2.write_u64((std::process::id() as u64).rotate_left(13));
+    format!("{:016x}{:016x}", h1.finish(), h2.finish())
+}
+
+/// 读一行（\n 结尾）。BufRead::lines()/read_line 会为超长行无上限扩容缓冲，
+/// 这里用 take() 封顶，超限返回错误由调用方断开连接。
+fn read_line_limited(reader: &mut impl BufRead, out: &mut String) -> std::io::Result<usize> {
+    out.clear();
+    let mut limited = reader.take((MAX_LINE_LEN + 1) as u64);
+    let n = limited.read_line(out)?;
+    if out.len() > MAX_LINE_LEN {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "line too long",
+        ));
+    }
+    Ok(n)
 }
 
 /// attach-only 预检：OpenOCD Tcl RPC 端口是否已监听（避免引擎退化为 spawn 抢占 probe）。
@@ -378,7 +523,7 @@ fn check_openocd_attachable(tcl_port: u16) -> Result<(), String> {
 }
 
 /// 服务一个客户端直到断开；返回后由调用方收尾。
-pub fn serve_one(listener: &TcpListener) {
+pub fn serve_one(listener: &TcpListener, token: String) {
     let (stream, _peer) = listener.accept().expect("accept first client");
     let _ = stream.set_nodelay(true);
     let reader = BufReader::new(match stream.try_clone() {
@@ -389,11 +534,11 @@ pub fn serve_one(listener: &TcpListener) {
         }
     });
     let (writer_tx, writer_rx) = unbounded::<String>();
-    let session = Arc::new(Session::new(writer_tx.clone()));
+    let session = Arc::new(Session::new(writer_tx.clone(), token));
 
     // writer 线程：独占 socket 写端
     let wstream = stream;
-    std::thread::Builder::new()
+    let writer_thread = std::thread::Builder::new()
         .name("agent-writer".into())
         .spawn(move || {
             let mut out = std::io::BufWriter::new(wstream);
@@ -409,4 +554,13 @@ pub fn serve_one(listener: &TcpListener) {
     session.run(reader);
     eprintln!("[agent] 客户端断开，关闭引擎");
     session.shutdown_engine();
+    // 关键：给 writer 一个有界冲刷窗口。若不等待，进程退出会杀掉 writer 线程，
+    // 排队中的最后一串响应/事件（如握手拒绝错误、Disconnected 事件）可能整体丢失，
+    // 插件侧只会看到连接关闭而无错误信息
+    drop(session);
+    drop(writer_tx);
+    let deadline = std::time::Instant::now() + Duration::from_millis(500);
+    while !writer_thread.is_finished() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }

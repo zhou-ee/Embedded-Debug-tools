@@ -28,7 +28,6 @@ def detect_java_home():
     if os.getenv("JAVA_HOME") and os.path.isdir(os.getenv("JAVA_HOME")):
         return os.getenv("JAVA_HOME")
     candidates = [
-        r"E:\Software\JetBrains IDE\CLion\jbr",
         r"C:\Program Files\JetBrains\CLion\jbr",
         r"C:\Program Files\Java\jdk-21",
         r"C:\Program Files\Java\jdk-17",
@@ -47,7 +46,8 @@ def get_plugin_version():
                 line = line.strip()
                 if line.startswith("version=") or line.startswith("pluginVersion="):
                     return line.split("=")[1].strip()
-    return "V1.2.14"
+    print("[!] 无法从 plugin/gradle.properties 读取版本号（version=/pluginVersion=）", file=sys.stderr)
+    sys.exit(1)
 
 
 def package():
@@ -58,7 +58,7 @@ def package():
     # 1. 编译最新的 Rust Agent
     print("[*] 正在编译最新 release 版 embedded-clion-agent...")
     res = subprocess.run(
-        ["cargo", "build", "--release", "-p", "embedded-clion-agent"],
+        ["cargo", "build", "--release", "--locked", "-p", "embedded-clion-agent"],
         cwd=AGENT_DIR,
         shell=False,
     )
@@ -88,7 +88,12 @@ def package():
         env["PATH"] = os.path.join(java_home, "bin") + os.pathsep + env.get("PATH", "")
 
     gradlew = os.path.join(PLUGIN_DIR, "gradlew.bat" if os.name == "nt" else "gradlew")
-    res = subprocess.run([gradlew, "buildPlugin"], cwd=PLUGIN_DIR, env=env, shell=False)
+    # PKG_GRADLE_OFFLINE=1：本地全量缓存已就绪时跳过一切依赖网络校验，
+    # 规避国内网络对 JVM TLS 连接的间歇性 RST 导致配置期无限挂死（CI 不受影响）
+    gradle_args = [gradlew, "buildPlugin"]
+    if os.getenv("PKG_GRADLE_OFFLINE") == "1":
+        gradle_args.append("--offline")
+    res = subprocess.run(gradle_args, cwd=PLUGIN_DIR, env=env, shell=False)
     if res.returncode != 0:
         print("[!] Gradle 构建插件失败！", file=sys.stderr)
         sys.exit(1)

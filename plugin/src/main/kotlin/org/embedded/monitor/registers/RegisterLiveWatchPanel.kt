@@ -89,7 +89,8 @@ class RegisterLiveWatchPanel(private val project: Project) : JBPanel<RegisterLiv
     var autoRefreshFreq: Int = 2
         private set
 
-    // SVD 模型与树模型
+    // SVD 模型与树模型（pooled 线程写、EDT 读，需要 @Volatile 保证可见性）
+    @Volatile
     private var svdDevice: SvdDevice? = null
     private val treeRoot = DefaultMutableTreeNode("Root")
     private val treeModel = DefaultTreeModel(treeRoot)
@@ -314,9 +315,19 @@ class RegisterLiveWatchPanel(private val project: Project) : JBPanel<RegisterLiv
                     addActionListener {
                         val reg = selectedRegister
                         if (reg != null) {
-                            val expr = "0x%08X:u32".format(Locale.ROOT, reg.address)
-                            agentService?.addWatch(expr)
-                            Messages.showInfoMessage(project, "已将 ${reg.name} (0x%08X) 添加到实时变量监视".format(Locale.ROOT, reg.address), "添加成功")
+                            // 按寄存器实际宽度生成类型后缀：硬编码 u32 会对 1/2 字节
+                            // 寄存器越界读到外设保留区
+                            val fmt = when (reg.size) { 1 -> "u8"; 2 -> "u16"; else -> "u32" }
+                            val expr = "0x%08X:$fmt".format(Locale.ROOT, reg.address)
+                            agentService?.addWatch(expr)?.whenComplete { _, err ->
+                                val msg = if (err != null) "添加 ${reg.name} 失败: ${err.message ?: "未知错误"}"
+                                else "已将 ${reg.name} (0x%08X) 添加到实时变量监视".format(Locale.ROOT, reg.address)
+                                val title = if (err != null) "添加失败" else "添加成功"
+                                com.intellij.util.ui.UIUtil.invokeLaterIfNeeded {
+                                    if (err != null) Messages.showErrorDialog(project, msg, title)
+                                    else Messages.showInfoMessage(project, msg, title)
+                                }
+                            }
                         }
                     }
                 }
@@ -789,6 +800,8 @@ class RegisterLiveWatchPanel(private val project: Project) : JBPanel<RegisterLiv
 
     /** 自动动态刷新（满足条件的寄存器） */
     fun refreshAuto() {
+        // 工具窗不可见时暂停轮询，不再空发 readMem
+        if (!isShowing()) return
         if (!autoRefreshAll && autoRefreshPaths.isEmpty()) return
         val visible = visibleRegisters()
         val targets = if (autoRefreshAll) {

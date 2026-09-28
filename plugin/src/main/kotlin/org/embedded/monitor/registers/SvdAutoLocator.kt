@@ -138,10 +138,6 @@ object SvdAutoLocator {
         System.getenv("SVD_PATH")?.let { out.add(it) }
         System.getenv("CMSIS_SVD_PATH")?.let { out.add(it) }
         System.getenv("CMSIS_SVD_DIR")?.let { out.add(it) }
-        val legacyPath = "E:/Software/Develop/Embeded/STM32_SVD/cmsis-svd-stm32"
-        if (File(legacyPath).isDirectory) {
-            out.add(legacyPath)
-        }
         out.addAll(WELL_KNOWN_SVD_DIRS)
         return out
     }

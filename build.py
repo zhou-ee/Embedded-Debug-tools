@@ -27,7 +27,6 @@ def detect_java_home():
         return os.getenv("JAVA_HOME")
 
     candidates = [
-        r"E:\Software\JetBrains IDE\CLion\jbr",
         r"C:\Program Files\JetBrains\CLion\jbr",
         r"C:\Program Files\Java\jdk-21",
         r"C:\Program Files\Java\jdk-17",

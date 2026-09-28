@@ -87,7 +87,10 @@ impl GdbEvaluator {
 
     /// 求值表达式，返回 value 字符串。
     pub fn evaluate(&mut self, expr: &str) -> Result<String, String> {
-        let escaped = expr.replace('\\', "\\\\").replace('"', "\\\"");
+        // MI 是行协议：表达式里的换行会把后续内容当独立 MI 命令执行，
+        // 必须剔除（C 表达式中的裸换行本身也不合法）
+        let sanitized: String = expr.chars().map(|c| if c == '\n' || c == '\r' { ' ' } else { c }).collect();
+        let escaped = sanitized.replace('\\', "\\\\").replace('"', "\\\"");
         let result = self.command(
             &format!("-data-evaluate-expression \"{escaped}\""),
             3000,
@@ -126,7 +129,11 @@ impl GdbEvaluator {
                     }
                     // 异步/流输出忽略
                 }
-                Err(_) => return Err(timeout_msg),
+                // 通道关闭 = GDB 进程已死，与超时区分开（误导诊断）
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(format!("GDB 进程已退出（命令: {cmd}）"));
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => return Err(timeout_msg),
             }
         }
     }
@@ -147,8 +154,11 @@ fn is_success_reply(line: &str, token: &str) -> bool {
 impl Drop for GdbEvaluator {
     fn drop(&mut self) {
         let _ = self.stdin.write_all(b"-gdb-exit\n");
+        let _ = self.stdin.flush();
         std::thread::sleep(Duration::from_millis(50));
         let _ = self.child.kill();
+        // reap：Unix 上不 wait 会留僵尸进程
+        let _ = self.child.wait();
     }
 }
 

@@ -18,10 +18,17 @@ jobs:
           workspaces: "agent -> agent/target"
       - name: Run Cargo Tests
         working-directory: agent
-        run: cargo test --workspace
+        # --locked：依赖图以 Cargo.lock 为准，防止 CI 悄悄升级依赖
+        run: cargo test --workspace --locked
       - name: Build Agent Release Binary
         working-directory: agent
-        run: cargo build --release -p embedded-clion-agent
+        run: cargo build --release --locked -p embedded-clion-agent
+      - name: Upload Agent Binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: embedded-clion-agent-windows
+          path: agent/target/release/embedded-clion-agent.exe
+          if-no-files-found: error
 
   plugin-test-and-build:
     name: CLion Plugin (Build & Test)
@@ -34,10 +41,16 @@ jobs:
           distribution: 'zulu'
           java-version: '21'
       - name: Setup Gradle
-        uses: gradle/actions/setup-gradle@v3
+        uses: gradle/actions/setup-gradle@v4
       - name: Run Plugin Tests
         working-directory: plugin
         run: ./gradlew test
       - name: Build Plugin Distribution
         working-directory: plugin
         run: ./gradlew buildPlugin
+      - name: Upload Plugin Distribution
+        uses: actions/upload-artifact@v4
+        with:
+          name: embedded-debug-plugin-distribution
+          path: plugin/build/distributions/*.zip
+          if-no-files-found: error

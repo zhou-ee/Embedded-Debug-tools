@@ -32,19 +32,37 @@ impl Default for ElfCache {
 impl ElfCache {
     /// 取（必要时加载/重建）指定路径的索引；加载在调用方线程之外发生，由调用方决定是否放线程。
     pub fn get(&self, path: &Path) -> Result<Arc<ElfIndex>, String> {
+        const MAX_ENTRIES: usize = 16;
         let canonical = path
             .canonicalize()
             .map_err(|e| format!("ELF 路径不存在: {} ({e})", path.display()))?;
         let mtime = std::fs::metadata(&canonical).ok().and_then(|m| m.modified().ok());
-        let mut entries = self.entries.lock();
-        if let Some(entry) = entries.get(&canonical) {
-            if entry.mtime == mtime {
-                return Ok(entry.index.clone());
+        // 快路径：命中且未变，直接返回
+        {
+            let entries = self.entries.lock();
+            if let Some(entry) = entries.get(&canonical) {
+                if entry.mtime == mtime {
+                    return Ok(entry.index.clone());
+                }
             }
         }
+        // 慢路径：ElfIndex::load 需数百毫秒，必须在锁外执行——elf_resolve /
+        // elf_type_at_addr 在主读循环线程上同步调 get，锁内加载会让读循环停摆
         let index = ElfIndex::load(&canonical)
             .map_err(|e| format!("ELF 解析失败: {}: {e:?}", canonical.display()))?;
         let index = Arc::new(index);
+        let mut entries = self.entries.lock();
+        // 双检：加载期间其他线程可能已重建同一索引，复用避免重复持有两份
+        if let Some(entry) = entries.get(&canonical) {
+            if entry.mtime == mtime {
+                *self.last.lock() = Some(canonical);
+                return Ok(entry.index.clone());
+            }
+        }
+        // 简单容量上限：长会话加载大量不同路径时防止内存单调增长
+        if entries.len() >= MAX_ENTRIES {
+            entries.clear();
+        }
         entries.insert(canonical.clone(), Entry { index: index.clone(), mtime });
         *self.last.lock() = Some(canonical);
         Ok(index)

@@ -19,6 +19,9 @@ import kotlin.math.max
  */
 object TornSampleFilter {
 
+    /** int 位模式重构的适用上限：float 只有 24 位有效尾数。 */
+    private const val INT24_LIMIT = 1 shl 24
+
     fun repairIfTorn(prev: Float, curr: Float, next: Float, format: ValueFormat): Float {
         if (curr.isNaN() || curr.isInfinite()) {
             return if (!prev.isNaN() && !prev.isInfinite() && !next.isNaN() && !next.isInfinite()) {
@@ -107,6 +110,9 @@ object TornSampleFilter {
     }
 
     private fun repairInt32(prev: Float, curr: Float, next: Float, vMid: Float, matchTol: Float): Float {
+        // 位模式重构基于"整数值经 float 转换后取整"：|v| >= 2^24 时 float 已无法精确
+        // 表示该值，重构出的位模式必然失真，宁可放弃修复也不修出错值
+        if (abs(curr) >= INT24_LIMIT || abs(prev) >= INT24_LIMIT || abs(next) >= INT24_LIMIT) return curr
         val currBits = curr.toLong().toInt()
         val prevBits = prev.toLong().toInt()
         val nextBits = next.toLong().toInt()
@@ -140,6 +146,7 @@ object TornSampleFilter {
     }
 
     private fun repairInt16(prev: Float, curr: Float, next: Float, vMid: Float, matchTol: Float): Float {
+        // 同 repairInt32：int16 全域可被 float 精确表示，无需边界保护
         val currBits = curr.toInt() and 0xFFFF
         val prevBits = prev.toInt() and 0xFFFF
         val nextBits = next.toInt() and 0xFFFF
@@ -174,18 +181,22 @@ object TornSampleFilter {
         val result = ArrayList<ScopeSample>(series.size)
         // 头部
         result.add(series[0])
+        // 记录最近一个有效修复值：尾部 NaN 不能直接复制前一修复点——
+        // 若前一点同样是 NaN 会把 NaN 继续传播出去
+        var lastValid = if (series[0].value.isNaN() || series[0].value.isInfinite()) Float.NaN else series[0].value
         for (i in 1 until series.size - 1) {
             val prev = result[i - 1].value
             val curr = series[i].value
             val next = series[i + 1].value
             val repaired = repairIfTorn(prev, curr, next, format)
             result.add(if (repaired != curr) ScopeSample(series[i].timestampNanos, repaired) else series[i])
+            if (!repaired.isNaN() && !repaired.isInfinite()) lastValid = repaired
         }
         // 尾部
         val lastIdx = series.size - 1
         val last = series[lastIdx]
         if (last.value.isNaN() || last.value.isInfinite()) {
-            result.add(ScopeSample(last.timestampNanos, result[lastIdx - 1].value))
+            result.add(ScopeSample(last.timestampNanos, lastValid))
         } else {
             result.add(last)
         }

@@ -5,10 +5,10 @@
 **专为 JetBrains CLion 打造的嵌入式高速无干扰实时变量监视（Live Variable Watch）、实时示波器（Oscilloscope）与外设寄存器实时监视（Register Live Watch）调试套件。**
 
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
-[![CLion](https://img.shields.io/badge/CLion-2024.2%20%7C%202026.x-green.svg)](https://www.jetbrains.com/clion/)
-[![Rust](https://img.shields.io/badge/Rust-1.75%2B-orange.svg)](https://www.rust-lang.org/)
+[![CLion](https://img.shields.io/badge/CLion-2024.3%2B-green.svg)](https://www.jetbrains.com/clion/)
+[![Rust](https://img.shields.io/badge/Rust-Stable-orange.svg)](https://www.rust-lang.org/)
 [![Kotlin](https://img.shields.io/badge/Kotlin-2.0%2B-purple.svg)](https://kotlinlang.org/)
-[![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey.svg)]()
+[![Platform](https://img.shields.io/badge/Platform-Windows%20%20(Linux%20%7C%20macOS%EF%BC%9A%E9%9C%80%E8%87%AA%E8%A1%8C%E7%BC%96%E8%AF%91%20Agent)-lightgrey.svg)]()
 
 [**English Documentation**](README.md) | [**版本演进日志 (CHANGELOG)**](CHANGELOG.md) | [**深度架构与交接文档 (HANDOVER)**](HANDOVER.md)
 
@@ -56,7 +56,7 @@
                       └───────────────────────────────────────┘
                                          │
                                          │ 本地 TCP JSON-RPC
-                                         │ (127.0.0.1:44445)
+                                         │ (127.0.0.1, 随机端口)
                                          ▼
                       ┌───────────────────────────────────────┐
                       │    embedded-clion-agent (Rust Daemon) │
@@ -114,12 +114,12 @@ Embedded Debug tools/
 1. 在 GitHub [Releases](../../releases) 页面下载最新发布的 `embedded-debug-plugin-V1.2.14-standalone.zip`；
 2. 打开 CLion，进入设置 **Settings** (`Ctrl+Alt+S`) -> **Plugins** -> 点击齿轮 ⚙️ -> **Install Plugin from Disk...**；
 3. 选择下载好的 `.zip` 文件，安装后重启 CLion；
-4. *说明：Standalone 发布包已内置编译好的原生 Rust Agent，使用者无需额外安装任何 Rust 编译环境！*
+4. *说明：Standalone 发布包已内置编译好的原生 Rust Agent，使用者无需额外安装任何 Rust 编译环境！当前内置 Agent 二进制仅支持 Windows，Linux/macOS 用户请通过方式二自行编译 Agent。*
 
 ### 方式二：从源码编译与打包
 #### 依赖准备
 - **JDK 17** 或 **JDK 21**（或直接使用 CLion 自带的 `jbr` 目录）；
-- **Rust Stable 1.75+**（确保 `cargo` 在 PATH 中）；
+- **Rust Stable**（最新稳定版工具链，确保 `cargo` 在 PATH 中）；
 - **Python 3.8+**。
 
 #### 一键构建命令

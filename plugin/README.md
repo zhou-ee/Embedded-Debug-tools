@@ -69,7 +69,7 @@ cargo build --release -p embedded-clion-agent
 
 # 推荐一键生成含 Agent 的 Standalone 完整离线发布包（在工程根目录运行）：
 python ../package.py
-# 产物：release\embedded-debug-plugin-V1.2.14-standalone.zip
+# 产物：release\embedded-debug-plugin-<版本号>-standalone.zip
 ```
 
 本地试运行：`gradlew runIde`（沙箱 CLion，从 Marketplace 安装 zip 亦可）。
@@ -102,8 +102,7 @@ python ../package.py
 
 本地 TCP JSON 行（每行一个 JSON）。请求 `{"id":1,"method":"...","params":{...}}`；
 响应 `{"id":1,"ok":true,"result":...}` / `{"id":1,"ok":false,"error":"..."}`；
-事件 `{"event":"engine","data":{"kind":"watchData",...}}`（转发 monitor 引擎 Event，
-与 Tauri 前端消费的 JSON 形状一致）。
+事件 `{"event":"engine","data":{"kind":"watchData",...}}`（转发 monitor 引擎 Event）。
 
 | 方法 | 参数 | 说明 |
 |---|---|---|

@@ -472,7 +472,9 @@ class AgentService(private val project: Project) : Disposable {
                 val sinceStateChange = System.currentTimeMillis() - lastStateChangeAt
                 if (sinceStateChange < backoffMs) return@scheduleWithFixedDelay
                 logLine("监督重连（第 $attempt 次）")
-                doConnectEngine().whenComplete { _, err ->
+                // 走 connectEngine 统一入口（inFlight 去重 + 状态收口）；supervised 模式
+                // 失败不清 desiredRunning，由本线程按退避继续重试
+                connectEngine(supervised = true).whenComplete { _, err ->
                     if (err != null) {
                         val msg = extractError(err) ?: err.message ?: "未知错误"
                         logLine("监督重连失败: $msg")
@@ -1107,8 +1109,9 @@ class AgentService(private val project: Project) : Disposable {
 
     @Volatile private var inFlightConnectFuture: CompletableFuture<Void>? = null
 
-    /** 连接目标（启动监视/示波采样）。异步非阻塞。 */
-    fun connectEngine(): CompletableFuture<Void> {
+    /** 连接目标（启动监视/示波采样）。异步非阻塞。supervised=true 表示由监督线程发起的自动重连：
+     *  不重置退避计数、不启看门狗、失败后保持期望运行态交回监督线程继续重试。 */
+    fun connectEngine(supervised: Boolean = false): CompletableFuture<Void> {
         desiredRunning.set(true)
 
         // 关键防护 1：已连接且处于 running 或 halted 态，直接判定成功并按需恢复刷新/快照，严禁触发重连
@@ -1141,10 +1144,12 @@ class AgentService(private val project: Project) : Disposable {
             return inFlight
         }
 
-        hasConnectedOnce.set(false)
-        reconnectAttempts.set(0)
+        if (!supervised) {
+            hasConnectedOnce.set(false)
+            reconnectAttempts.set(0)
+        }
         lastStateChangeAt = System.currentTimeMillis()
-        val future = doConnectEngine()
+        val future = doConnectEngine(supervised = supervised)
         inFlightConnectFuture = future
         return future
     }
@@ -1195,7 +1200,7 @@ class AgentService(private val project: Project) : Disposable {
             (!isDebugging || attachedSessions.isEmpty())
     }
 
-    private fun doConnectEngine(): CompletableFuture<Void> {
+    private fun doConnectEngine(supervised: Boolean = false): CompletableFuture<Void> {
         // 如果调试器此时处于断点暂停，则直接保持断点态，绝不启动看门狗与底层全量重连
         if (org.embedded.monitor.cmake.OpenOcdConfigReader.isAnySessionPaused(project)) {
             isHaltedByDebug = true
@@ -1208,7 +1213,8 @@ class AgentService(private val project: Project) : Disposable {
 
         engineState = "connecting"
         lastEngineError = null
-        startConnectWatchdog(15)
+        // 监督重连不启看门狗：瞬时失败不应弹"连接超时"打扰用户，由监督线程按退避继续
+        if (!supervised) startConnectWatchdog(15)
         return ensureAgent().thenComposeAsync({
             val client = clientRef.get()
                 ?: return@thenComposeAsync CompletableFuture.failedFuture<Void>(IllegalStateException("agent 未启动"))
@@ -1265,11 +1271,13 @@ class AgentService(private val project: Project) : Disposable {
                     if (engineState == "connecting") {
                         cancelConnectWatchdog()
                         engineState = "disconnected"
-                        desiredRunning.set(false)
                         val isOpenOcdDebugExited = isOpenOcdDebugExited()
                         val msg = if (isOpenOcdDebugExited) null else (extractError(err) ?: err.message ?: "连接失败")
                         lastEngineError = msg
                         lastStateChangeAt = System.currentTimeMillis()
+                        // 仅用户主动发起的连接失败才放弃期望运行态；监督重连失败交回
+                        // 监督线程按退避继续（否则一次瞬时失败就静默放弃重连）
+                        if (!supervised) desiredRunning.set(false)
                     }
                 }
             }
@@ -1600,11 +1608,13 @@ class AgentService(private val project: Project) : Disposable {
     fun loadElf(file: File, source: String): CompletableFuture<Boolean> {
         val future = CompletableFuture<Boolean>()
         ensureAgent().whenComplete { _, err ->
-            if (err != null) {
-                future.completeExceptionally(err)
+            val client = clientRef.get()
+            if (err != null || client == null) {
+                // client 为 null：ensureAgent 成功后 agent 恰好被关闭。必须异常完成，
+                // 否则调用方 get(60s/90s) 只能干等超时
+                future.completeExceptionally(err ?: IllegalStateException("agent 已关闭，无法加载 ELF"))
                 return@whenComplete
             }
-            val client = clientRef.get()!!
             ApplicationManager.getApplication().executeOnPooledThread {
                 try {
                     val p = JsonObject()
@@ -2311,5 +2321,8 @@ class AgentService(private val project: Project) : Disposable {
 
     override fun dispose() {
         closeAgent()
+        // 监督/推送调度器若不关闭，项目关闭后仍会周期性访问已 dispose 的 project
+        supervisor.shutdownNow()
+        pushExecutor.shutdownNow()
     }
 }

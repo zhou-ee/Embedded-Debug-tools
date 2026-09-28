@@ -21,8 +21,9 @@ pub struct OpenOcdBackend {
     tcl_port: u16,
     child: Option<Child>,
     stream: Option<BufReader<TcpStream>>,
-    /// 已发出但尚未读取响应的命令帧数（同步命令前的自动排空保护）
-    pending: usize,
+    /// Windows 专属：kill-on-close Job Object，agent 崩溃时内核自动收割 openocd
+    #[cfg(windows)]
+    job: Option<crate::openocd_job::Job>,
 }
 
 impl OpenOcdBackend {
@@ -41,7 +42,8 @@ impl OpenOcdBackend {
             tcl_port: TCL_PORT,
             child: None,
             stream: None,
-            pending: 0,
+            #[cfg(windows)]
+            job: None,
         }
     }
 
@@ -65,7 +67,6 @@ impl OpenOcdBackend {
         stream.set_write_timeout(Some(Duration::from_millis(2000))).ok();
         stream.set_nodelay(true).ok();
         self.stream = Some(BufReader::new(stream));
-        self.pending = 0;
         Ok(())
     }
 
@@ -85,9 +86,25 @@ impl OpenOcdBackend {
             use std::os::windows::process::CommandExt;
             cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
         }
+        #[cfg(unix)]
+        {
+            // 独立进程组：agent 异常退出后可整组清理（无内核级自动收割）
+            use std::os::unix::process::CommandExt;
+            let _ = cmd.process_group(0);
+        }
         let child = cmd
             .spawn()
             .map_err(|e| BackendError::ConnectionLost(format!("启动 OpenOCD 失败: {e}")))?;
+        // kill-on-close Job Object：agent 崩溃/被强杀时 Drop 不会执行，
+        // 由内核关闭 Job 句柄连带杀掉 openocd，不再遗留孤儿占用 USB 探针
+        #[cfg(windows)]
+        match crate::openocd_job::Job::create().and_then(|j| {
+            j.assign(&child)?;
+            Ok(j)
+        }) {
+            Ok(j) => self.job = Some(j),
+            Err(e) => eprintln!("[openocd] Job Object 关联失败（孤儿保护不可用）: {e}"),
+        }
         self.child = Some(child);
         // 等待 Tcl server 就绪（对照原版固定 1.5s，改为轮询更快）。
         // connect_timeout 200ms × 50 次 ≈ 3s 上限：localhost 拒绝连接是瞬时的，
@@ -116,12 +133,6 @@ impl OpenOcdBackend {
     /// 若按瞬时错误处理继续复用，残留在管道里的上一条响应会与后续命令
     /// 错位配对（表现为 read_memory 收到 curstate 文本 → "期望 N 得到 0"）。
     pub fn tcl(&mut self, cmd: &str) -> Result<String, BackendError> {
-        // 若有示波流水线在途帧：先排空（内容是过期采样，可安全丢弃），
-        // 否则同步命令会读到错位的旧响应
-        while self.pending > 0 {
-            self.tcl_recv()?;
-            self.pending -= 1;
-        }
         self.tcl_send(cmd)?;
         self.tcl_recv()
     }
@@ -132,7 +143,6 @@ impl OpenOcdBackend {
         payload.push(FRAME);
         if let Err(e) = stream.get_mut().write_all(&payload) {
             self.stream = None;
-            self.pending = 0;
             return Err(BackendError::ConnectionLost(format!("Tcl 写失败: {e}")));
         }
         Ok(())
@@ -144,7 +154,6 @@ impl OpenOcdBackend {
         match stream.read_until(FRAME, &mut out) {
             Ok(0) => {
                 self.stream = None;
-                self.pending = 0;
                 return Err(BackendError::ConnectionLost("Tcl 连接关闭".into()));
             }
             Ok(_) => {
@@ -153,20 +162,33 @@ impl OpenOcdBackend {
                 }
                 if out.len() > 4 * 1024 * 1024 {
                     self.stream = None;
-                    self.pending = 0;
                     return Err(BackendError::ConnectionLost("Tcl 响应过大".into()));
                 }
             }
             Err(e) => {
                 // 超时或 IO 错误：帧同步已破坏，重建连接
                 self.stream = None;
-                self.pending = 0;
                 return Err(BackendError::ConnectionLost(format!(
                     "Tcl 读失败（连接将重建）: {e}"
                 )));
             }
         }
         Ok(String::from_utf8_lossy(&out).into_owned())
+    }
+}
+
+/// OpenOCD 失败时错误文本就是本帧响应（帧同步完好）。halt/resume/reset 族此前
+/// 不校验响应内容，失败被当成功，后续"重下断点→恢复"建立在错误前提上。
+fn check_inband_error(resp: &str) -> Result<(), BackendError> {
+    let lower = resp.to_lowercase();
+    if lower.contains("error")
+        || lower.contains("failed")
+        || lower.contains("timed out")
+        || lower.contains("invalid command")
+    {
+        Err(BackendError::Transfer(resp.to_string()))
+    } else {
+        Ok(())
     }
 }
 
@@ -247,7 +269,6 @@ impl DebugBackend for OpenOcdBackend {
             }
         }
         self.stream = None;
-        self.pending = 0;
         if let Some(mut child) = self.child.take() {
             match child.try_wait() {
                 Ok(Some(_)) => {} // 已按 shutdown 退出
@@ -366,28 +387,28 @@ impl DebugBackend for OpenOcdBackend {
     }
 
     fn halt(&mut self) -> Result<(), BackendError> {
-        self.tcl("halt")?;
-        Ok(())
+        let resp = self.tcl("halt")?;
+        check_inband_error(&resp)
     }
 
     fn resume(&mut self) -> Result<(), BackendError> {
-        self.tcl("resume")?;
-        Ok(())
+        let resp = self.tcl("resume")?;
+        check_inband_error(&resp)
     }
 
     fn step(&mut self) -> Result<(), BackendError> {
-        self.tcl("step")?;
-        Ok(())
+        let resp = self.tcl("step")?;
+        check_inband_error(&resp)
     }
 
     fn reset(&mut self) -> Result<(), BackendError> {
-        self.tcl("reset run")?;
-        Ok(())
+        let resp = self.tcl("reset run")?;
+        check_inband_error(&resp)
     }
 
     fn reset_and_halt(&mut self) -> Result<(), BackendError> {
-        self.tcl("reset halt")?;
-        Ok(())
+        let resp = self.tcl("reset halt")?;
+        check_inband_error(&resp)
     }
 
     fn is_halted(&mut self) -> Result<bool, BackendError> {

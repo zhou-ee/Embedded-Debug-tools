@@ -711,6 +711,11 @@ impl Engine {
             }
             Err(e) => {
                 if params.attach_only {
+                    // attach-only 不自动重试（探针可能被调试器占用），但必须发事件：
+                    // 此前静默清空 params，UI 永远等不到 Disconnected，只能靠超时猜
+                    self.emit(Event::Disconnected {
+                        reason: format!("连接失败（attach-only 模式不自动重试）: {e}"),
+                    });
                     self.params = None;
                 } else {
                     self.emit(Event::Log {
@@ -1597,8 +1602,10 @@ impl Engine {
 /// 从合并块中切出目标字节。
 fn extract_from_blocks(blocks: &[(u64, Vec<u8>)], addr: u64, size: usize) -> Option<Vec<u8>> {
     for (start, bytes) in blocks {
-        let end = start + bytes.len() as u64;
-        if addr >= *start && addr + size as u64 <= end {
+        // checked 算术：入口校验之外再兜底，防止异常 addr 让比较回绕/切片 panic
+        let end = start.checked_add(bytes.len() as u64)?;
+        let want_end = addr.checked_add(size as u64)?;
+        if addr >= *start && want_end <= end {
             let offset = (addr - start) as usize;
             return Some(bytes[offset..offset + size].to_vec());
         }

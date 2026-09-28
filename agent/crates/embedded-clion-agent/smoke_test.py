@@ -15,7 +15,8 @@ agent = subprocess.Popen([AGENT, "--port", "0"], stdout=subprocess.PIPE, stderr=
 ready = agent.stdout.readline().strip()
 print("READY:", ready)
 assert ready.startswith("CLION_AGENT_READY"), ready
-port = int(ready.split("port=")[1].split()[0])
+fields = dict(kv.split("=", 1) for kv in ready.split()[1:] if "=" in kv)
+port = int(fields["port"])
 
 sock = socket.create_connection(("127.0.0.1", port), timeout=5)
 sock_file = sock.makefile("r", encoding="utf-8")
@@ -57,6 +58,10 @@ def check(name, cond, detail=""):
     tag = "PASS" if cond else "FAIL"
     if not cond: fail += 1
     print(f"[{tag}] {name} {detail}")
+
+# 0. hello 握手（协议 v1：第一条消息必须携带就绪行中的 token）
+r = call("hello", {"token": fields.get("token", "")})
+check("hello 握手", r.get("proto") == 1, r)
 
 # 1. ping
 r = call("ping")

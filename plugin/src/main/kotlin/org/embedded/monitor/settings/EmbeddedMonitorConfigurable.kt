@@ -65,7 +65,8 @@ class EmbeddedMonitorConfigurable(private val project: Project) : Configurable {
             .panel
             applyFromSettings()
 
-        detectedLabel.text = detectCandidatesText()
+        // 扫描构建目录/CMake File API 是磁盘 IO，不能在 EDT 同步做（设置页卡顿）
+        refreshDetectedLabelAsync()
         backendCombo.addActionListener {
             val isOcd = backendCombo.selectedItem == "openocd"
             attachOnlyCheck.isEnabled = isOcd
@@ -79,6 +80,14 @@ class EmbeddedMonitorConfigurable(private val project: Project) : Configurable {
         val cands = AgentService.getInstance(project).listElfCandidates()
         return if (cands.isEmpty()) "当前工程未探测到 ELF（构建后刷新）"
         else "探测到 ${cands.size} 个 ELF：${cands.take(3).joinToString { it.file.name }}${if (cands.size > 3) " …" else ""}"
+    }
+
+    private fun refreshDetectedLabelAsync() {
+        detectedLabel.text = "正在扫描 ELF …"
+        com.intellij.openapi.application.ApplicationManager.getApplication().executeOnPooledThread {
+            val text = runCatching { detectCandidatesText() }.getOrElse { "ELF 探测失败: ${it.message}" }
+            com.intellij.util.ui.UIUtil.invokeLaterIfNeeded { detectedLabel.text = text }
+        }
     }
 
     private fun applyFromSettings() {
@@ -115,7 +124,8 @@ class EmbeddedMonitorConfigurable(private val project: Project) : Configurable {
             pauseOnBpCheck.isSelected != s.pausePollingOnBreakpoint ||
             (speedSpinner.value as Int) != s.speedHz ||
             (freqSpinner.value as Double) != s.scopeFreqHz ||
-            currentSelectedWatchFreq != s.watchRefreshFreq ||
+            // 两侧都过 snapWatchFreq 归一，避免存量非法值导致"应用"按钮永久点亮
+            currentSelectedWatchFreq != EmbeddedMonitorSettings.snapWatchFreq(s.watchRefreshFreq) ||
             elfOverrideField.text != s.elfOverride ||
             elfAutoCheck.isSelected != s.elfAuto
     }
@@ -147,7 +157,7 @@ class EmbeddedMonitorConfigurable(private val project: Project) : Configurable {
 
     override fun reset() {
         applyFromSettings()
-        detectedLabel.text = detectCandidatesText()
+        refreshDetectedLabelAsync()
     }
 
     /** 从 CLion 的 OpenOCD 运行配置预填充 board-config。 */

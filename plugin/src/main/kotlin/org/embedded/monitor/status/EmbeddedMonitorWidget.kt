@@ -1,7 +1,6 @@
 package org.embedded.monitor.status
 
 import com.intellij.openapi.project.Project
-import com.intellij.openapi.util.Disposer
 import com.intellij.openapi.wm.StatusBar
 import com.intellij.openapi.wm.StatusBarWidget
 import com.intellij.openapi.wm.ToolWindowManager
@@ -22,14 +21,20 @@ class EmbeddedMonitorWidget(private val project: Project) : StatusBarWidget, Sta
 
     private var statusBar: StatusBar? = null
     private val timer = javax.swing.Timer(1000) { update() }
+    private var lastText: String? = null
 
     init {
-        Disposer.register(this) { timer.stop() }
+        // 生命周期：工厂 disposeWidget → dispose() 停表。widget 不进 Disposer 树，
+        // 在这里挂 Disposer.register(this) 永远不会触发（会导致 project 泄漏）。
         timer.start()
     }
 
     private fun update() {
-        statusBar?.updateWidget(ID)
+        val t = text()
+        if (t != lastText) {
+            lastText = t
+            statusBar?.updateWidget(ID)
+        }
     }
 
     private fun text(): String = when (AgentService.getInstance(project).engineState) {
@@ -87,5 +92,7 @@ class EmbeddedMonitorWidget(private val project: Project) : StatusBarWidget, Sta
 
     override fun getClickConsumer(): Consumer<java.awt.event.MouseEvent> = Consumer { click()?.run() }
 
-    override fun dispose() {}
+    override fun dispose() {
+        timer.stop()
+    }
 }

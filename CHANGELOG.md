@@ -1,5 +1,67 @@
 # Changelog
 
+> **路径映射说明**：V1.2.x 历史条目中的 `software_ref/` 对应本仓库现在的 `agent/`，
+> `package_release.py` 对应 `package.py`（项目在开源重构前为 software_ref 单体工程）。
+
+## [V1.2.15] — 工程化与安全加固版本
+
+> ⚠️ **破坏性协议变更**：插件与 agent 引入行协议 v1（就绪行携带 `proto=1` 与一次性连接令牌，
+> 客户端第一条消息必须是携带 token 的 hello）。插件与 agent **必须同版本安装**，旧 agent 会被插件
+> 明确报错提示。真机（STM32G431 + CMSIS-DAP）端到端测试 26 项全部通过。
+
+### Agent（embedded-clion-agent / debug-core / monitor）
+- **引擎收尾确定性**：客户端断开后 `serve_one` 会 join 事件泵线程（3s 上限），保证引擎清 DWT 比较器/断点、
+  resume 目标的清理路径执行完毕进程才退出（此前清理在正常断开路径上会被进程退出整段杀掉，
+  目标板被遗留断点/停机态污染）；`connect` 重启引擎前同样等待旧引擎收尾，消除新旧引擎抢占同一 probe 的竞态；
+  writer 线程获得有界冲刷窗口，最后一串响应（握手拒绝/断开事件）不再随机丢失。
+- **协议工程化（协议版本 → 1）**：就绪行新增 `proto=<n>` 与一次性 `token=<hex>`；插件接入后第一条消息
+  必须是携带正确 token 的 hello，否则拒绝并退出（防本机其它用户进程扫到端口后读写目标内存/halt 设备）；
+  拒绝绑定非回环地址；单行请求 4MB 长度上限；JSON 解析失败与握手拒绝的响应回显请求 id。
+- **内存安全**：来自 JSON 的 addr/size 在协议入口统一校验（32 位地址空间 + checked 算术），
+  消除 debug 构建溢出 panic / release 回绕巨型读块的隐患；`write_bytes` 增加与读路径同源的越界预检；
+  读请求跨出内存区域末尾由静默截断改为显式报错（截断会让上层拿"短了却当完整"的数据解出错误数值）；
+  `speedHz/tclPort` 超范围报错而非静默截断。
+- **OpenOCD 后端**：`halt/resume/step/reset` 族校验带内错误文本（此前失败被当成功，后续"重下断点→恢复"
+  建立在错误前提上）；自启的 OpenOCD 挂入 kill-on-close Job Object（Windows），agent 崩溃时内核自动收割，
+  不再遗留孤儿进程占用 USB 探针（Unix 加独立进程组）；清理死代码 `pending` 字段。
+- **健壮性**：attach-only 连接失败现在会发出 `Disconnected` 事件（此前引擎永久静默死亡，UI 只能靠超时猜）；
+  GDB/MI 求值器区分进程退出与超时、剔除表达式中的换行、Drop 收尾 reap 僵尸进程；
+  ElfCache 解析移出缓存锁（不再阻塞主读循环）+ 16 条容量上限。
+- **DWARF**：多维数组展开加单级 4096 上限与 `checked_mul`，畸形/超大数组不再可打爆内存或溢出 size。
+
+### 插件（CLion Plugin）
+- **生命周期**：`AgentService.dispose()` 现在关闭 supervisor/pushExecutor 调度器（此前项目关闭后仍每 2s
+  访问已 dispose 的 project）；状态栏 Widget 的 1s Timer 在 `dispose()` 中停止（此前每关一个工程泄漏一个
+  widget 及整个 project 引用）；`AgentClient.start()` 在连接失败时销毁已启动的 agent 进程（不再产生孤儿）；
+  `loadElf` 在 agent 恰好关闭时异常完成而非挂起。
+- **重连策略**：监督线程自动重连改走 `connectEngine(supervised)` 统一入口——瞬时失败不再静默放弃期望
+  连接态，按 2/4/8/16/32s 退避持续重试；监督路径不启看门狗、不弹"连接超时"打扰。
+- **协议适配**：就绪行解析 `proto` 并校验（版本不匹配 fail-fast 提示）；hello 握手发送 token；
+  agent stdout 就绪行之后持续排水；单行 JSON 解析失败只丢该行不判死连接。
+- **安全加固**：SVD 解析与 `workspace.xml` 读取统一禁用 DOCTYPE/外部实体（XXE/实体炸弹防护）；
+  SVD dim 展开封顶 4096 并限制 dimIncrement，畸形 SVD 不再可 OOM；SVD 二进制字面量 `#0110` 正确按二进制解析
+  （此前当十进制 110）；移除硬编码开发者个人 SVD 路径。
+- **EDT 与性能**：设置页 ELF 候选扫描移入后台线程；示波器全量快照克隆移出 EDT 且防重入堆积；
+  波形时间戳极值改为写入点重算、查询 O(1)（此前 paint/hover/drag 每帧全量扫描，50k×通道×30fps 下
+  每秒数百万次比较）；面板不可见时跳过 33ms 波形重绘 Timer 与寄存器轮询；波形画布内部 repaintTimer
+  纳入 dispose 链（此前永不停止）。
+- **数据正确性**：撕裂样本修复对 |值|≥2²⁴ 的整型放弃修复（float 位模式失真，宁可放弃不修错）；
+  寄存器"添加到实时变量监视"按实际宽度生成 u8/u16/u32（此前硬编码 u32 可能越界读外设保留区），
+  并等待添加结果再提示；"添加到示波器"在地址已是通道时回收本次添加的 watch。
+- **杂项**：`_Bool` 类型别名修正；`repairSeries` 尾部 NaN 不再传播；设置页 isModified 双侧 snap 归一。
+
+### 构建与发布
+- **兼容范围固定**：`build.gradle.kts` 显式 `sinceBuild="243"`、不设上限；本地 CLion 探测改为显式 opt-in
+  （`CLION_HOME`/`-Pclion.home`），默认一律 pinned `clion("2024.3")`——发布产物的兼容范围不再随构建机漂移
+  （此前本机构建出的包实际仅支持 2026.2+，与文档宣称的 2024.2+ 不符）。
+- **发布流水线**：新增 tag 触发的 `release.yml`（构建 + package.py + SHA256 上传 GitHub Release）；
+  CI 上传 agent/plugin 构建产物、`cargo --locked`、`setup-gradle@v4`。
+- **开源净化**：Gradle wrapper 换官方发行源；移除脚本/源码/文档中的个人机器路径；
+  `package.py` 版本号缺失改为报错退出；CHANGELOG 补 `software_ref/` 路径映射说明；
+  `plugin/CHANGELOG.md` 合并为根目录指针；README 修正 agent 端口（随机端口而非 44445）、
+  平台说明（当前发布仅内置 Windows agent）与 Rust 版本要求；LICENSE 补版权附录。
+- **测试**：新增真机端到端脚本 `scripts/test_hw_e2e.py`（协议握手/负向用例/真机连接/内存校验/数据流/干净退出）。
+
 ## [V1.2.14]
 - **彻底根治指针/结构体数组成员（如 `g_chassis_ptr._ctx.data[0].vx` 与 `data[1].vx`）地址偏移计算缺失导致示波器添加失败与数据冲突缺陷**：
   - **后端 DWARF 数组结构体成员偏移步进缺失修复（`software_ref/crates/elf-info`）**：

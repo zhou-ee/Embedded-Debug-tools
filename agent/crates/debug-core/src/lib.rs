@@ -10,6 +10,8 @@ use std::time::{Duration, Instant};
 pub mod flash;
 pub mod gdb_mi;
 pub mod openocd;
+#[cfg(windows)]
+pub mod openocd_job;
 pub mod probe;
 pub mod probers_backend;
 pub mod sim;

@@ -112,10 +112,17 @@ class ScopeWaveformPanel : JPanel() {
         }
 
     private val repaintTimer = Timer(33) {
+        // 工具窗隐藏时跳过：33ms 空转唤醒 EDT 纯耗电；needsRepaint 保留，显示后照常重绘
+        if (!isShowing()) return@Timer
         if (needsRepaint) {
             needsRepaint = false
             repaint()
         }
+    }
+
+    /** 由持有方在 dispose 链调用。Timer 不停会经 TimerQueue 钉住整个组件图（含 project）。 */
+    fun stopRepaintTimer() {
+        repaintTimer.stop()
     }
 
     private val marginLeft = 68
@@ -286,6 +293,7 @@ class ScopeWaveformPanel : JPanel() {
     fun setFrame(data: Map<Long, List<ScopeSample>>, variables: List<ScopeVariable>) {
         this.data = data
         this.variables = variables
+        recomputeTimeExtremes()
         if (!isPaused) {
             needsRepaint = true
         }
@@ -294,6 +302,8 @@ class ScopeWaveformPanel : JPanel() {
     fun clear() {
         data = emptyMap()
         variables = emptyList()
+        cachedLatestNanos = Long.MIN_VALUE
+        cachedEarliestNanos = Long.MAX_VALUE
         viewEndSec = 0.0
         followLatest = true
         autoRange = true
@@ -461,28 +471,36 @@ class ScopeWaveformPanel : JPanel() {
     fun referenceSeries(): List<ScopeSample>? =
         data.values.maxByOrNull { it.size }
 
-    /** 数据集中的最新时间戳（秒）。 */
-    fun latestTimeSec(): Double {
-        var latest = 0.0
+    // 时间戳极值缓存：paint/hover/drag 每帧多次查询，若每次都对全部样本 O(n) 扫描，
+    // 50k×通道×30fps 会造成每秒数百万次比较。setFrame/clear 写入点重算一次，查询 O(1)。
+    private var cachedLatestNanos: Long = Long.MIN_VALUE
+    private var cachedEarliestNanos: Long = Long.MAX_VALUE
+
+    private fun recomputeTimeExtremes() {
+        var latest = Long.MIN_VALUE
+        var earliest = Long.MAX_VALUE
         for (series in data.values) {
-            if (series.isNotEmpty()) {
-                val t = (series.maxOfOrNull { it.timestampNanos } ?: 0L) / 1e9
-                if (t > latest) latest = t
+            for (s in series) {
+                if (s.timestampNanos > latest) latest = s.timestampNanos
+                if (s.timestampNanos < earliest) earliest = s.timestampNanos
             }
         }
-        return latest
+        cachedLatestNanos = latest
+        cachedEarliestNanos = earliest
+    }
+
+    /** 数据集中的最新时间戳（秒）。 */
+    fun latestTimeSec(): Double {
+        val latest = cachedLatestNanos
+        if (latest == Long.MIN_VALUE) return 0.0
+        return (latest / 1e9).coerceAtLeast(0.0)
     }
 
     /** 数据集中的最早时间戳（秒）。 */
     fun earliestTimeSec(): Double {
-        var earliest = Double.POSITIVE_INFINITY
-        for (series in data.values) {
-            if (series.isNotEmpty()) {
-                val t = (series.minOfOrNull { it.timestampNanos } ?: 0L) / 1e9
-                if (t < earliest) earliest = t
-            }
-        }
-        return if (earliest.isInfinite()) 0.0 else earliest
+        val earliest = cachedEarliestNanos
+        if (earliest == Long.MAX_VALUE) return 0.0
+        return earliest / 1e9
     }
 
     private fun labelFont(style: Int, sizePt: Float): Font =

@@ -19,6 +19,12 @@ import javax.xml.parsers.DocumentBuilderFactory
  */
 object SvdParser {
 
+    /** dim 展开单项上限：防御畸形/恶意 SVD 的 OOM。 */
+    private const val MAX_DIM_EXPAND = 4096
+
+    /** dimIncrement 上限（字节），防御地址算术溢出。 */
+    private const val MAX_DIM_INCREMENT = 0x1000_0000L
+
     fun parse(file: File): SvdDevice {
         return file.inputStream().use { parse(it) }
     }
@@ -27,10 +33,18 @@ object SvdParser {
         val factory = DocumentBuilderFactory.newInstance().apply {
             isNamespaceAware = false
             isValidating = false
+            // SVD 会被自动定位器从工程目录拾取，属不可信输入：统一禁 DTD/外部实体，
+            // 防 XXE / 实体炸弹（billion laughs）
             runCatching {
                 setFeature("http://apache.org/xml/features/nonvalidating/load-external-dtd", false)
                 setFeature("http://xml.org/sax/features/namespaces", false)
+                setFeature("http://apache.org/xml/features/disallow-doctype-decl", true)
+                setFeature("http://xml.org/sax/features/external-general-entities", false)
+                setFeature("http://xml.org/sax/features/external-parameter-entities", false)
+                setFeature(javax.xml.XMLConstants.FEATURE_SECURE_PROCESSING, true)
             }
+            isXIncludeAware = false
+            isExpandEntityReferences = false
         }
         val doc = factory.newDocumentBuilder().parse(inputStream)
         val root = doc.documentElement
@@ -190,11 +204,12 @@ object SvdParser {
         }
         val sortedFields = fields.sortedBy { it.bitOffset }
 
-        // 检查 dim 数组
+        // 检查 dim 数组（畸形 SVD 的超大 dim/dimIndex 会展开出巨量对象，必须封顶）
         val dimStr = regElem.childText("dim")
-        val dimCount = dimStr?.let { parseNumber(it).toInt() } ?: 0
+        val dimCount = (dimStr?.let { parseNumber(it).toInt() } ?: 0).coerceIn(0, MAX_DIM_EXPAND)
         if (dimCount > 1) {
             val dimInc = (regElem.childText("dimIncrement")?.let { parseNumber(it) } ?: sizeBytes.toLong())
+                .coerceIn(0L, MAX_DIM_INCREMENT)
             val dimIndexStr = regElem.childText("dimIndex")
             val indices = resolveDimIndices(dimIndexStr, dimCount)
 
@@ -288,13 +303,15 @@ object SvdParser {
         }
         val trimmed = dimIndexStr.trim()
         if (trimmed.contains(",")) {
-            return trimmed.split(",").map { it.trim() }
+            return trimmed.split(",").take(MAX_DIM_EXPAND).map { it.trim() }
         }
         val rangeMatch = Regex("""(\d+)-(\d+)""").find(trimmed)
         if (rangeMatch != null) {
             val start = rangeMatch.groupValues[1].toInt()
             val end = rangeMatch.groupValues[2].toInt()
-            return (start..end).map { it.toString() }
+            if (end >= start) {
+                return (start..minOf(end, start + MAX_DIM_EXPAND - 1)).map { it.toString() }
+            }
         }
         return (0 until count).map { it.toString() }
     }
@@ -311,9 +328,12 @@ object SvdParser {
 
     fun parseNumber(s: String?): Long {
         if (s.isNullOrBlank()) return 0L
+        // SVD 二进制字面量："#0110" = 0b0110 = 6（此前直接删 '#' 当十进制解析，结果错误）
+        val binLiteral = s.trim().startsWith("#")
         val clean = s.trim().replace("#", "").replace("_", "")
         return try {
             when {
+                binLiteral -> clean.toLong(2)
                 clean.startsWith("0x", ignoreCase = true) -> clean.substring(2).toLong(16)
                 clean.startsWith("0b", ignoreCase = true) -> clean.substring(2).toLong(2)
                 else -> clean.toLongOrNull() ?: clean.toLongOrNull(16) ?: 0L

@@ -69,7 +69,7 @@ enum class ValueFormat {
             "i64", "int64", "int64_t", "s64", "long long" -> I64 to 8
             "f32", "float" -> F32 to 4
             "f64", "double" -> F64 to 8
-            "bool", "_bool", "_bool" -> U8 to 1
+            "bool", "_Bool" -> U8 to 1
             "ptr", "pointer" -> U32 to 4
             else -> null
         }

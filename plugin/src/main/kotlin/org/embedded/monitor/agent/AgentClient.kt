@@ -56,17 +56,26 @@ class AgentClient(
         val proc = pb.start()
         process = proc
 
-        // 读就绪行：CLION_AGENT_READY port=<n> pid=<n>
-        val port: Int
+        // 读就绪行：CLION_AGENT_READY port=<n> pid=<n> proto=<n> token=<hex>
+        val stdout = BufferedReader(InputStreamReader(proc.inputStream, StandardCharsets.UTF_8))
+        val ready: ReadyInfo
         try {
-            val stdout = BufferedReader(InputStreamReader(proc.inputStream, StandardCharsets.UTF_8))
-            port = readReadyPort(stdout)
+            ready = readReadyInfo(stdout)
         } catch (e: Exception) {
             proc.destroyForcibly()
+            process = null
             throw IllegalStateException("读取 agent 就绪信号失败: ${e.message}", e)
         }
-        agentPort = port
-        onLog("agent 已启动 port=$port pid=${proc.pid()}")
+        if (ready.proto != EXPECTED_PROTOCOL) {
+            proc.destroyForcibly()
+            process = null
+            throw IllegalStateException(
+                "agent 协议版本不匹配（agent proto=${ready.proto}，插件期望 proto=$EXPECTED_PROTOCOL）。" +
+                    "请同步更新插件与 embedded-clion-agent 至同一版本。",
+            )
+        }
+        agentPort = ready.port
+        onLog("agent 已启动 port=${ready.port} pid=${proc.pid()} proto=${ready.proto}")
 
         // agent 的 stderr 直接转发到 IDE 日志（debug 用）
         Thread({
@@ -76,10 +85,48 @@ class AgentClient(
 
         // 连接
         val sock = Socket()
-        sock.connect(InetSocketAddress("127.0.0.1", port), 5000)
-        sock.tcpNoDelay = true
+        try {
+            sock.connect(InetSocketAddress("127.0.0.1", ready.port), 5000)
+            sock.tcpNoDelay = true
+        } catch (e: Exception) {
+            // 连接失败时必须杀掉已启动的 agent，否则成为孤儿进程占用端口/探针
+            try { sock.close() } catch (_: Exception) {}
+            proc.destroyForcibly()
+            process = null
+            throw IllegalStateException("连接 agent 端口 ${ready.port} 失败: ${e.message}", e)
+        }
         socket = sock
-        writer = BufferedWriter(OutputStreamWriter(sock.getOutputStream(), StandardCharsets.UTF_8))
+        val w = BufferedWriter(OutputStreamWriter(sock.getOutputStream(), StandardCharsets.UTF_8))
+        writer = w
+
+        // stdout 排水：就绪行之后 agent 若再向 stdout 打日志，避免管道撑满反压卡死
+        Thread({
+            while (stdout.readLine() != null) { /* 丢弃 */ }
+        }, "agent-stdout-drain").apply { isDaemon = true }.start()
+
+        // 协议握手：hello 必须是第一条消息（agent 校验 token，不匹配即断开）
+        try {
+            synchronized(writeLock) {
+                val hello = JsonObject().apply {
+                    addProperty("id", 0)
+                    addProperty("method", "hello")
+                    add(
+                        "params",
+                        JsonObject().apply {
+                            if (ready.token != null) addProperty("token", ready.token)
+                        },
+                    )
+                }
+                w.write(gson.toJson(hello))
+                w.write("\n")
+                w.flush()
+            }
+        } catch (e: Exception) {
+            proc.destroyForcibly()
+            process = null
+            try { sock.close() } catch (_: Exception) {}
+            throw IllegalStateException("发送 agent 握手失败: ${e.message}", e)
+        }
 
         Thread({
             runReader(sock)
@@ -95,15 +142,19 @@ class AgentClient(
         }, "agent-exit-watch").apply { isDaemon = true }.start()
     }
 
-    private fun readReadyPort(stdout: BufferedReader): Int {
+    private class ReadyInfo(val port: Int, val proto: Int, val token: String?)
+
+    private fun readReadyInfo(stdout: BufferedReader): ReadyInfo {
         // 就绪行有 5s 宽限（agent 绑定端口应当是毫秒级）
         val deadline = System.currentTimeMillis() + 5000
         while (System.currentTimeMillis() < deadline) {
             val line = stdout.readLine() ?: break
             val trimmed = line.trim()
             if (trimmed.startsWith("CLION_AGENT_READY")) {
-                val m = Regex("port=(\\d+)").find(trimmed) ?: continue
-                return m.groupValues[1].toInt()
+                val port = Regex("port=(\\d+)").find(trimmed)?.groupValues?.get(1)?.toInt() ?: continue
+                val proto = Regex("proto=(\\d+)").find(trimmed)?.groupValues?.get(1)?.toInt() ?: 0
+                val token = Regex("token=([0-9a-zA-Z]+)").find(trimmed)?.groupValues?.get(1)
+                return ReadyInfo(port, proto, token)
             }
         }
         throw IllegalStateException("agent 未在 5 秒内报告就绪端口")
@@ -115,7 +166,13 @@ class AgentClient(
             while (!closed) {
                 val line = reader.readLine() ?: break
                 if (line.isBlank()) continue
-                val obj = JsonParser.parseString(line).asJsonObject
+                // 单行解析失败只丢该行并记日志，不判死整条连接
+                val obj = try {
+                    JsonParser.parseString(line).asJsonObject
+                } catch (e: Exception) {
+                    log.warn("忽略无法解析的 agent 行: ${line.take(200)}", e)
+                    continue
+                }
                 when {
                     obj.has("event") -> {
                         val name = obj.get("event").asString
@@ -208,6 +265,9 @@ class AgentClient(
     }
 
     companion object {
+        /** 与 agent 端（main.rs PROTOCOL_VERSION）约定同步递增的行协议版本。 */
+        const val EXPECTED_PROTOCOL = 1
+
         /** 找空闲本地端口（避免和 agent 的 --port 0 打架，这里只用于测试辅助）。 */
         fun freePort(): Int = ServerSocket(0).use { it.localPort }
     }
