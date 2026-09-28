@@ -3,6 +3,53 @@
 > **路径映射说明**：V1.2.x 历史条目中的 `software_ref/` 对应本仓库现在的 `agent/`，
 > `package_release.py` 对应 `package.py`（项目在开源重构前为 software_ref 单体工程）。
 
+## [V1.2.17] — 只读审查修复批次：正确性、进程生命周期与 EDT 纪律
+
+> 本版为代码审查（插件 + agent + 构建链全量只读评审，逐条源码实证）后的集中修复。
+> 行协议仍为 v1（`write_mem` 由"发后即忘"改为请求-应答，请求/响应字段不变，插件与 agent 需同版本安装）。
+
+### Agent（embedded-clion-agent / monitor / debug-core / elf-info）
+- **write_mem 假成功修复**：引擎此前丢弃 `write_bytes` 返回值，探针未连接/地址不可写时
+  插件也收到 `ok:true`。改为 `WriteMemSync` 请求-应答语义（2s 超时），失败错误回传 UI；
+- **双引擎抢 probe 防护**：旧引擎收尾超时（3s）后不再 detach 掉头 spawn 新引擎——
+  句柄转入僵尸表，`connect` 前再等一程（至多 7s），仍不退出则明确报错拒绝本次连接
+  （探针尚在旧引擎手中，由插件监督重连自然重试），绝不带病双开；
+- **自启 OpenOCD 下发 tcl_port**：spawn 时追加 `-c "tcl_port N"`——此前 cfg 默认 6666
+  与轮询端口不一致时陷入"拉起→超时→杀掉"死循环；超时错误文本不再硬编码 6666，
+  `try_wait` IO 失败不再被静默吞掉；
+- **引擎线程 panic 隔离**：`catch_unwind` 捕获后发 `Event::Error`——此前库内 panic
+  静默杀死引擎线程，UI 表现为"连接还在但永远无响应"；
+- **GDB 求值启动移出引擎线程**：符号加载（实测 3.6s、上限 30s）+ 两次 target-select
+  此前同步阻塞引擎最长 45s；改为独立线程异步预热、结果回收，失败退避 3s→6s→…→60s 封顶；
+- **条件断点为假路径对齐**：resume 失败不再发假 Running 边沿（与 Resume/Reset/step_out 一致，
+  杜绝同一次断点命中重复上报）；
+- **scope_burst 越界显式报错**：probe-rs 后端采样范围越出区域末尾由静默截断改为 Transfer
+  报错（示波目标贴 RAM 顶端时通道此前会静默消失）；OpenOCD 8-bit 回退路径补带内错误检查；
+- **SetWatchFreq NaN 防护**：非有限值回落默认频率（`Duration::from_secs_f64(NaN)` 会 panic）；
+- **Tcl 帧读取 take() 封顶**：4MB 上界在读取前生效（帧错位时内存不再无界增长）；
+- **elf_resolve / elf_type_at_addr 异步化**：缓存未命中时数百 ms 的 ELF 重建不再阻塞读循环；
+- **ElfCache 逐出保护**：容量满只逐出非活跃条目，不再 `clear()` 全清（避免自我破坏缓存）；
+- **DWARF 畸形输入防护**：数组计数 `upper+1`/多维乘积/总 size 改 checked/饱和算术，
+  `addr_for_line` 行号饱和加法；
+- **杂项**：gdb_mi 读线程创建失败时显式收割子进程；probe-rs Registry 进程内缓存
+  （此前每次目标搜索全量重建上百 ms）；亚 kHz 速率钳到 1kHz；移除读循环中的死长度检查。
+
+### Plugin (V1.2.17)
+- **agent 就绪行读取有界化**：`readLine()` 无限期阻塞（agent 启动卡住时）改为
+  有界轮询 + 缓冲拼行——此前会永久占用线程、Future 永不完成、agent 进程成孤儿；
+- **dispose 与 agent 启动竞态防护**：启动任务在 `start()` 前后自检 disposed，
+  工程关闭后拉起的 agent 立即回收，不再泄漏到 IDE 退出；
+- **addWatch 的 `ensureAgent().get()` 加 20s 超时**；
+- **调试会话监听器挂会话级 Disposable**：会话结束即注销，不再随启停次数逐次累积；
+- **EDT 纪律补齐**：CSV 导出与文件对话框改为"pooled 取快照 → EDT 弹框 → pooled 写文件"；
+  "自适应通道范围"改用新增的单通道轻量快照接口（不再全量克隆）；ELF 管理弹窗候选扫描
+  池化；SVD 重新加载的兜底全工程扫描池化；LiveWatch 面板 tick/数据回调加 `isShowing()`
+  守卫（波形时间极值的逐点全扫经评估为刻意容忍乱序数据的防御行为，保留）；
+- **符号树批量添加失败通知**：此前失败被静默吞掉且照常提示"添加了 N 个"；
+- **事件/响应行解析加固**：字段访问异常只丢行不再误判死整条连接；
+- **示波采样率上限对齐**：面板 spinner 1–50000 → 1–5000（引擎本就钳 5000），
+  存量越界配置在两处 UI 均钳回显示；设置页实现 `disposeUIResources`；移除死字段。
+
 ## [V1.2.16] — 示波通道同名子树防混淆 + 整型默认格式拆雷
 
 > **根因报告（真机实证）**：`g_chassis_ptr._ctx.seq @0x20000484` 与 `g_chassis_ctx_ptr.seq @0x200002A8`

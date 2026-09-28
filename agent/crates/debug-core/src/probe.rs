@@ -61,10 +61,17 @@ pub fn open_first_available() -> Result<(probe_rs::probe::Probe, String), String
     ))
 }
 
+/// 内置 registry 全局缓存：`from_builtin_families()` 每次都要解析全部内联
+/// pack（上百 ms），UI 每敲一个过滤字符都付全价——解析一次进程内共享
+fn builtin_registry() -> &'static probe_rs::config::Registry {
+    static REGISTRY: std::sync::OnceLock<probe_rs::config::Registry> = std::sync::OnceLock::new();
+    REGISTRY.get_or_init(probe_rs::config::Registry::from_builtin_families)
+}
+
 /// 列出 registry 内目标芯片（filter 为不区分大小写子串；空返回全部）。
 pub fn list_targets(filter: &str) -> Vec<TargetInfo> {
     let needle = filter.to_lowercase();
-    let registry = probe_rs::config::Registry::from_builtin_families();
+    let registry = builtin_registry();
     let mut out = Vec::new();
     for family in registry.families() {
         let vendor = family

@@ -27,6 +27,7 @@ import com.intellij.util.ui.JBUI
 import com.intellij.util.ui.UIUtil
 import org.embedded.monitor.agent.AgentService
 import org.embedded.monitor.agent.SymbolNode
+import org.embedded.monitor.cmake.ElfAutoResolver
 import org.embedded.monitor.settings.EmbeddedMonitorSettings
 import java.awt.BorderLayout
 import java.awt.Component
@@ -429,7 +430,10 @@ class LiveWatchPanel(private val project: Project) :
 
     private val watchDataListener: () -> Unit = {
         ApplicationManager.getApplication().invokeLater {
-            if (!Disposer.isDisposed(this)) {
+            // 面板不可见时跳过树遍历/重绘（数据仍在 service 缓冲，显示后由
+            // tick 自然刷新）——这是最高频的 EDT 刷新路径，与 Scope/Register
+            // 面板的 isShowing 守卫保持一致
+            if (!Disposer.isDisposed(this) && isShowing()) {
                 updateNodeBytes(rootNode)
                 tree.repaint()
                 updateStatusLabel(service.engineState)
@@ -710,6 +714,9 @@ class LiveWatchPanel(private val project: Project) :
      * 周期调度：状态同步、ELF 变动检查与数据刷新。
      */
     private fun tick() {
+        // 工具窗隐藏时跳过整轮刷新（树遍历 + repaint 是 EDT 重活，ELF 检查
+        // 与设置同步推迟到再次可见的首拍，与 Scope/Register 面板守卫一致）
+        if (!isShowing()) return
         val settingFreq = EmbeddedMonitorSettings.snapWatchFreq(settings.watchRefreshFreq)
         if (settingFreq != watchRefreshFreq) {
             setWatchRefreshFreq(settingFreq)
@@ -977,21 +984,34 @@ class LiveWatchPanel(private val project: Project) :
             }
         })
 
-        val candidates = service.listElfCandidates()
-        if (candidates.isNotEmpty()) {
-            popup.addSeparator()
-            for (cand in candidates) {
-                val isSelected = cand.file.canonicalPath == currentElf
-                val label = (if (isSelected) "✓ " else "  ") + cand.file.name + " (" + cand.file.parentFile.name + ")"
-                popup.add(JMenuItem(label).apply {
-                    icon = AllIcons.FileTypes.Archive
-                    addActionListener {
-                        service.loadElf(cand.file, "手动切换")
+        // 候选扫描（递归目录 + CMake File API JSON 解析）是磁盘 IO，不能在
+        // EDT 同步做：pooled 扫描完成后回到 EDT 构建菜单再弹出（EDT 不阻塞，
+        // 弹窗出现的延迟等于扫描耗时，与原实现观感一致）
+        popup.addSeparator()
+        ApplicationManager.getApplication().executeOnPooledThread {
+            val candidates = runCatching { service.listElfCandidates() }.getOrElse { emptyList() }
+            // 预计算标签与选中态（canonicalPath 也是磁盘 IO）
+            val entries: List<Pair<String, ElfAutoResolver.Candidate>> = candidates.map { cand ->
+                val isSelected = runCatching { cand.file.canonicalPath == currentElf }.getOrDefault(false)
+                (if (isSelected) "✓ " else "  ") + cand.file.name + " (" + cand.file.parentFile.name + ")" to cand
+            }
+            com.intellij.util.ui.UIUtil.invokeLaterIfNeeded {
+                if (!isShowing()) return@invokeLaterIfNeeded
+                if (entries.isNotEmpty()) {
+                    for ((label, cand) in entries) {
+                        popup.add(JMenuItem(label).apply {
+                            icon = AllIcons.FileTypes.Archive
+                            addActionListener {
+                                service.loadElf(cand.file, "手动切换")
+                            }
+                        })
                     }
-                })
+                } else {
+                    popup.add(JMenuItem("未探测到候选 ELF").apply { isEnabled = false })
+                }
+                popup.show(invoker, 0, invoker.height)
             }
         }
-        popup.show(invoker, 0, invoker.height)
     }
 
     private fun reloadElf() {

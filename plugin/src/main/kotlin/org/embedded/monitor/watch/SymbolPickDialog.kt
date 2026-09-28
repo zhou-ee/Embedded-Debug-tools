@@ -138,11 +138,25 @@ class SymbolPickDialog(
             super.doOKAction()
             return
         }
-        for (expr in newExprs) {
-            service.addWatch(expr)
+        // addWatch 异步执行：挂 whenComplete 汇总失败项并通知——此前 future 被丢弃，
+        // 全部失败也无任何反馈（甚至照常提示"添加了 N 个"）
+        val futures = newExprs.map { expr -> expr to service.addWatch(expr) }
+        if (futures.isNotEmpty()) {
+            java.util.concurrent.CompletableFuture.allOf(*futures.map { it.second }.toTypedArray())
+                .whenComplete { _, _ ->
+                    val failed = futures.filter { it.second.isCompletedExceptionally }
+                    if (failed.isNotEmpty()) {
+                        val preview = failed.take(5).joinToString("、") { it.first } +
+                            if (failed.size > 5) " 等 ${failed.size} 项" else ""
+                        service.notify(
+                            "有 ${failed.size} 个变量添加失败（ELF 未加载 / agent 掉线 / 符号不可读）：$preview",
+                            com.intellij.notification.NotificationType.WARNING,
+                        )
+                    }
+                }
         }
         if (alreadyAdded.isNotEmpty()) {
-            service.notify("添加了 ${newExprs.size} 个新变量，跳过 ${alreadyAdded.size} 个已存在变量", com.intellij.notification.NotificationType.INFORMATION)
+            service.notify("已提交 ${newExprs.size} 个新变量（解析完成后出现在列表中），跳过 ${alreadyAdded.size} 个已存在变量", com.intellij.notification.NotificationType.INFORMATION)
         }
         super.doOKAction()
     }

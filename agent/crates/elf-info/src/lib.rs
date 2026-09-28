@@ -227,8 +227,8 @@ impl ElfIndex {
         if let Some(addr) = self.basename_line_index.get(&(base.clone(), line)) {
             return Some((*addr, line));
         }
-        // 向后寻找最近可断点行
-        for probe in line + 1..line + 40 {
+        // 向后寻找最近可断点行（饱和加法：u32::MAX 附近的畸形行号不再 panic/回绕）
+        for probe in line.saturating_add(1)..line.saturating_add(40) {
             if let Some(addr) = self.file_line_index.get(&(norm.clone(), probe)) {
                 return Some((*addr, probe));
             }

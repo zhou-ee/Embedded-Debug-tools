@@ -77,7 +77,6 @@ class AgentService(private val project: Project) : Disposable {
     private val attachedSessions = java.util.Collections.newSetFromMap(
         java.util.concurrent.ConcurrentHashMap<com.intellij.xdebugger.XDebugSession, Boolean>()
     )
-    @Volatile private var resumeDebounceFuture: ScheduledFuture<*>? = null
 
     // ---------- ELF ----------
     @Volatile var elfPath: String? = null
@@ -672,6 +671,14 @@ class AgentService(private val project: Project) : Disposable {
         if (!attachedSessions.add(session)) return
         registerLiveWatchDebugTab(session)
         registerRegisterDebugTab(session)
+        // 监听器挂会话级 Disposable：此前 parent 为工程级 service，会话结束后
+        // 注册节点（持有 session 强引用）不注销，反复启停调试会话逐次累积。
+        // 会话正常结束时在 sessionStopped 主动 dispose；工程关闭时作为 service
+        // 的子节点兜底释放
+        val sessionDisposable = com.intellij.openapi.util.Disposer.newDisposable(
+            "EmbeddedMonitor debug session listener"
+        )
+        com.intellij.openapi.util.Disposer.register(this, sessionDisposable)
         session.addSessionListener(object : com.intellij.xdebugger.XDebugSessionListener {
             override fun sessionPaused() {
                 registerLiveWatchDebugTab(session)
@@ -699,13 +706,14 @@ class AgentService(private val project: Project) : Disposable {
                         ui.removeContent(c, true)
                     }
                 }
+                com.intellij.openapi.util.Disposer.dispose(sessionDisposable)
                 onDebugSessionStopped(session)
             }
 
             override fun beforeSessionResume() {
                 onDebugSessionBeforeResume(session)
             }
-        }, this)
+        }, sessionDisposable)
 
         // 仅当非刚启动的已有会话在挂载时已明确停在断点上时，才同步暂停态；
         // 刚启动的调试进程（isNewProcess == true）在 GDB 握手/复位阶段绝不误判为用户断点暂停！
@@ -1048,6 +1056,9 @@ class AgentService(private val project: Project) : Disposable {
 
     private val agentInitLock = Any()
     @Volatile private var agentInitFuture: CompletableFuture<Void>? = null
+    /** dispose 与 agent 启动任务存在竞态窗口（locateAgent IO + start 秒级），
+     *  关闭后启动任务必须自检放弃，否则拉起的 agent 进程无人回收 */
+    @Volatile private var disposed = false
 
     private fun closeAgent() {
         clientRef.getAndSet(null)?.close()
@@ -1069,6 +1080,10 @@ class AgentService(private val project: Project) : Disposable {
             agentInitFuture = future
             ApplicationManager.getApplication().executeOnPooledThread {
                 try {
+                    if (disposed) {
+                        future.completeExceptionally(IllegalStateException("工程已关闭，取消 agent 启动"))
+                        return@executeOnPooledThread
+                    }
                     closeAgent()
                     val path = locateAgent(settings.agentPath, project)
                     if (path == null) {
@@ -1091,6 +1106,12 @@ class AgentService(private val project: Project) : Disposable {
                         onLog = { logLine(it) },
                     )
                     client.start()
+                    if (disposed) {
+                        // start 期间工程已关闭：立即回收，避免孤儿 agent 进程
+                        client.close()
+                        future.completeExceptionally(IllegalStateException("工程已关闭，agent 已回收"))
+                        return@executeOnPooledThread
+                    }
                     clientRef.set(client)
                     agentRunning = true
                     lastAgentError = null
@@ -1692,7 +1713,8 @@ class AgentService(private val project: Project) : Disposable {
         val future = CompletableFuture<WatchItem>()
         ApplicationManager.getApplication().executeOnPooledThread {
             try {
-                ensureAgent().get() // elf 解析需要 agent 在线
+                // 无超时 get() 会在 agent 启动挂死时永久占用 pooled 线程
+                ensureAgent().get(20, java.util.concurrent.TimeUnit.SECONDS)
                 if (!elfLoaded) {
                     autoDetectElf().get(60, java.util.concurrent.TimeUnit.SECONDS)
                 }
@@ -2019,6 +2041,12 @@ class AgentService(private val project: Project) : Disposable {
         cachedSnapshot
     }
 
+    /** 单通道快照：只克隆该通道序列。轻量查询（如"自适应通道范围"）专用，
+     *  避免 scopeSnapshot() 在版本变化时对全通道做整份克隆。 */
+    fun scopeSeriesSnapshot(addr: Long): List<ScopeSample>? = synchronized(bufLock) {
+        scopeSeries[addr]?.let { ArrayList(it) }
+    }
+
     /** 获取各通道最新有效末值（O(1) 快速查询，供表格刷新，绝不克隆全量历史数据）。 */
     fun scopeLastValues(): Map<Long, Float> = synchronized(bufLock) {
         val map = LinkedHashMap<Long, Float>(scopeSeries.size)
@@ -2320,6 +2348,7 @@ class AgentService(private val project: Project) : Disposable {
 
 
     override fun dispose() {
+        disposed = true
         closeAgent()
         // 监督/推送调度器若不关闭，项目关闭后仍会周期性访问已 dispose 的 project
         supervisor.shutdownNow()

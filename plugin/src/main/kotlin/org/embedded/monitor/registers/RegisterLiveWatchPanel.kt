@@ -716,11 +716,17 @@ class RegisterLiveWatchPanel(private val project: Project) : JBPanel<RegisterLiv
                 return
             }
         }
-        val autoFile = SvdAutoLocator.locateSvdFile(project)
-        if (autoFile != null) {
-            loadSvdFile(autoFile)
-        } else {
-            openSvdFileChooser()
+        // 兜底全工程递归扫描是磁盘 IO，不能在 EDT 同步做（面板其余 IO 均已池化）
+        ApplicationManager.getApplication().executeOnPooledThread {
+            val autoFile = runCatching { SvdAutoLocator.locateSvdFile(project) }.getOrNull()
+            UIUtil.invokeLaterIfNeeded {
+                if (Disposer.isDisposed(this)) return@invokeLaterIfNeeded
+                if (autoFile != null) {
+                    loadSvdFile(autoFile)
+                } else {
+                    openSvdFileChooser()
+                }
+            }
         }
     }
 

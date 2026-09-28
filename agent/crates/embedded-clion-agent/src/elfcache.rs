@@ -59,9 +59,22 @@ impl ElfCache {
                 return Ok(entry.index.clone());
             }
         }
-        // 简单容量上限：长会话加载大量不同路径时防止内存单调增长
-        if entries.len() >= MAX_ENTRIES {
-            entries.clear();
+        // 简单容量上限：长会话加载大量不同路径时防止内存单调增长。
+        // 只逐出一个非活跃条目——clear() 全清会连 last 指向的当前索引一起删，
+        // 下一条查询立刻未命中、在读循环线程上重新全量解析（自我破坏缓存）
+        if entries.len() >= MAX_ENTRIES && !entries.contains_key(&canonical) {
+            let last_path = self.last.lock().clone();
+            let victim = entries
+                .keys()
+                .find(|k| Some(k.as_path()) != last_path.as_deref())
+                .cloned();
+            match victim {
+                Some(v) => {
+                    entries.remove(&v);
+                }
+                // 理论不可达（last 只是其中之一），兜底防死循环
+                None => entries.clear(),
+            }
         }
         entries.insert(canonical.clone(), Entry { index: index.clone(), mtime });
         *self.last.lock() = Some(canonical);

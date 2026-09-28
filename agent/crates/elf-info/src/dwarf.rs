@@ -737,14 +737,28 @@ fn build_type_node<'a>(
                     )
                 })?;
             let counts = array_counts(unit, &entry);
-            let total_count: u64 = if counts.is_empty() { 0 } else { counts.iter().product() };
+            // 畸形 DWARF 防护：upper+1 / 多维计数相乘在 u64::MAX 附近会溢出
+            // （debug panic 杀 elf_load 线程、release 回绕出荒谬 size）。
+            // 溢出按"未知大小"处理（total_count=0 → size=0），展开上限不受影响
+            let total_count: u64 = if counts.is_empty() {
+                0
+            } else {
+                counts
+                    .iter()
+                    .try_fold(1u64, |acc, &c| acc.checked_mul(c))
+                    .unwrap_or(0)
+            };
+            let expand_count = total_count.min(MAX_ARRAY_EXPAND);
             let total = if byte_size > 0 {
                 byte_size
             } else {
-                (elem.size as u64 * total_count) as u32
+                // size 用真实元素数（饱和乘 + 结果钳到 u32）；截断只影响展开
+                (elem.size as u64)
+                    .saturating_mul(total_count)
+                    .min(u32::MAX as u64) as u32
             };
             let mut members = Vec::new();
-            for i in 0..total_count.min(MAX_ARRAY_EXPAND) {
+            for i in 0..expand_count {
                 let mut m = elem.clone();
                 m.name = format!("[{i}]");
                 let elem_offset = i * elem.size as u64;
@@ -1153,7 +1167,8 @@ fn array_counts(unit: &Unit<R<'_>>, entry: &Die<'_, '_>) -> Vec<u64> {
                 .flatten()
                 .and_then(|a| a.udata_value())
             {
-                counts.push(upper + 1);
+                // u64::MAX 的 upper_bound（畸形 DWARF）+1 会溢出：饱和处理
+                counts.push(upper.saturating_add(1));
             }
         }
     }

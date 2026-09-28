@@ -93,7 +93,13 @@ pub enum Command {
     ConfigureGdb { gdb_path: String, elf_path: String },
     /// 更新表达式监视目标（GDB 求值，halt 时刷新）。
     UpdateExprTargets(Vec<ExprTarget>),
-    WriteMem { addr: u64, data: Vec<u8> },
+    /// 同步写内存：写入结果必须回传调用方——此前返回值被丢弃，
+    /// 探针未连接/地址不可写时插件也收到 ok，用户误以为已改成功
+    WriteMemSync {
+        addr: u64,
+        data: Vec<u8>,
+        reply: Sender<Result<(), String>>,
+    },
     /// 同步读内存（指针追踪 / STL 展开 / 数组视图）
     ReadMemSync {
         addr: u64,
@@ -181,8 +187,27 @@ pub fn spawn_engine() -> MonitorHandle {
     let join = std::thread::Builder::new()
         .name("monitor-engine".into())
         .spawn(move || {
-            let mut engine = Engine::new(cmd_rx, event_tx);
-            engine.run();
+            // panic 隔离：引擎线程若因后端库 panic 而死，此前所有 send 静默失败、
+            // 事件通道无任何告知，UI 表现为"连接还在但永远无响应"。捕获后至少
+            // 发一条 Error 事件让用户看到，且 unwind 过程中 Engine 字段正常 drop
+            // （probe-rs Session 析构会释放探针）。
+            let panic_tx = event_tx.clone();
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                let mut engine = Engine::new(cmd_rx, event_tx);
+                engine.run();
+            }));
+            if let Err(payload) = result {
+                let msg = if let Some(s) = payload.downcast_ref::<&str>() {
+                    (*s).to_string()
+                } else if let Some(s) = payload.downcast_ref::<String>() {
+                    s.clone()
+                } else {
+                    "未知 panic".to_string()
+                };
+                let _ = panic_tx.send(Event::Error {
+                    message: format!("监视引擎线程异常退出（panic）: {msg}；请重新连接"),
+                });
+            }
         })
         .expect("spawn monitor engine");
     MonitorHandle {
@@ -190,6 +215,12 @@ pub fn spawn_engine() -> MonitorHandle {
         event_rx,
         join: Some(join),
     }
+}
+
+/// GDB 启动失败退避：3s 起步、每失败一次翻倍、60s 封顶。
+/// 固定 3s 会在 gdb_port 不匹配时无限刷"连接失败"日志。
+fn gdb_backoff(fail_count: u32) -> Duration {
+    Duration::from_secs((3u64.saturating_mul(1 << fail_count.min(4))).min(60))
 }
 
 // Cortex-M 调试寄存器（内存映射，**必须 32 位访问**——字节访问会被硬件静默
@@ -271,6 +302,13 @@ struct Engine {
     gdb: Option<debug_core::gdb_mi::GdbEvaluator>,
     gdb_config: Option<(String, String)>, // (gdb_path, elf_path)
     gdb_retry_at: Instant,
+    /// GDB 启动/连接在独立线程进行（符号加载实测 3.6s、上限 30s——同步做会冻结
+    /// 引擎线程，期间 Halt/Resume/采样全部停摆）；结果经此通道回收
+    gdb_result_rx: Option<std::sync::mpsc::Receiver<Result<debug_core::gdb_mi::GdbEvaluator, String>>>,
+    /// 是否已有在飞的 GDB 启动尝试
+    gdb_attempting: bool,
+    /// 连续失败次数（退避递增：3s→6s→…→60s 封顶，避免端口不匹配时刷屏重试）
+    gdb_fail_count: u32,
     expr_targets: Vec<ExprTarget>,
     /// 非致命错误限流（同文本 1 秒内只上报一条）
     last_error_text: String,
@@ -315,6 +353,9 @@ impl Engine {
             gdb: None,
             gdb_config: None,
             gdb_retry_at: now,
+            gdb_result_rx: None,
+            gdb_attempting: false,
+            gdb_fail_count: 0,
             expr_targets: Vec::new(),
             // 空文本与任何错误都不同，首条错误必然放行
             last_error_text: String::new(),
@@ -339,6 +380,9 @@ impl Engine {
             if self.shutdown {
                 break;
             }
+
+            // 回收异步 GDB 启动结果（不阻塞引擎循环）
+            self.poll_gdb_result();
 
             if self.backend.is_none() && self.params.is_some() {
                 self.try_reconnect();
@@ -516,7 +560,13 @@ impl Engine {
                 self.next_scope = Instant::now();
             }
             Command::SetWatchFreq(freq) => {
-                let clamped = freq.clamp(1.0, 50.0);
+                // clamp 对 NaN 返回 NaN → Duration::from_secs_f64 panic（库直调可达，
+                // 引擎线程死亡且上层静默）；非有限值一律回落默认频率
+                let clamped = if freq.is_finite() {
+                    freq.clamp(1.0, 50.0)
+                } else {
+                    DEFAULT_WATCH_FREQ
+                };
                 self.watch_freq = clamped;
                 let watch_interval = Duration::from_secs_f64(1.0 / clamped);
                 let now = Instant::now();
@@ -612,6 +662,10 @@ impl Engine {
             Command::ConfigureGdb { gdb_path, elf_path } => {
                 self.gdb_config = Some((gdb_path, elf_path));
                 self.gdb = None;
+                // 丢弃在飞的旧尝试（其结果通道随 rx 一起丢弃，尝试线程发送失败后自行退出）
+                self.gdb_result_rx = None;
+                self.gdb_attempting = false;
+                self.gdb_fail_count = 0;
                 self.gdb_retry_at = Instant::now();
             }
             Command::UpdateExprTargets(targets) => {
@@ -620,10 +674,15 @@ impl Engine {
                     self.eval_expressions();
                 }
             }
-            Command::WriteMem { addr, data } => {
-                self.with_backend(|b| b.write_bytes(addr, &data));
-                // 立即刷新一次 watch
+            Command::WriteMemSync { addr, data, reply } => {
+                let result = match self.with_backend(|b| b.write_bytes(addr, &data)) {
+                    Some(()) => Ok(()),
+                    // None = 未连接，或写入出错（on_backend_error 已限流上报）
+                    None => Err("写内存失败（目标未连接或写入报错，详见引擎错误日志）".to_string()),
+                };
+                // 写入后刷新一次 watch（写的是被监视变量时立刻反映）
                 self.next_watch = Instant::now();
+                let _ = reply.send(result);
             }
             Command::ReadMemSync { addr, size, reply } => {
                 // 这是"请求-应答"语义：错误应当交回**调用方**判断 —— 调用栈回溯把
@@ -1164,8 +1223,12 @@ impl Engine {
                 Ok(false) => {
                     // 条件为假：跳过断点继续跑
                     self.step_past_breakpoint(bp.addr & !1);
-                    self.with_backend(|b| b.resume());
-                    self.mark_running();
+                    // 与 Resume/Reset/step_out 路径对齐：只有 resume 实际成功才置
+                    // running 边沿——Transfer 失败时目标仍停着，发假 Running 会让
+                    // 下次 poll 出假边沿重报同一次停住
+                    if self.with_backend(|b| b.resume()).is_some() {
+                        self.mark_running();
+                    }
                     return;
                 }
                 Err(e) => {
@@ -1322,34 +1385,65 @@ impl Engine {
         }
     }
 
-    /// 惰性启动 GDB（失败 3 秒退避，对照原版 _gdb_retry_time）。
+    /// 惰性启动 GDB（异步：启动/连接在独立线程，完成结果由 poll_gdb_result 回收）。
+    /// 此前在引擎线程同步执行符号加载（实测 3.6s、上限 30s）+ 两次 target-select，
+    /// 期间所有 Command（含 Halt/Resume）停摆，表现为"断点命中后 UI 卡死"。
     fn ensure_gdb(&mut self) {
-        if self.gdb.is_some() {
+        if self.gdb.is_some() || self.gdb_attempting {
             return;
         }
         let Some((gdb_path, elf_path)) = self.gdb_config.clone() else { return };
         if Instant::now() < self.gdb_retry_at {
             return;
         }
-        self.gdb_retry_at = Instant::now() + Duration::from_secs(3);
-        match debug_core::gdb_mi::GdbEvaluator::spawn(&gdb_path) {
-            Ok(mut gdb) => match gdb.connect(&elf_path, 3333) {
-                Ok(()) => {
-                    self.emit(Event::Log {
-                        message: "GDB 表达式求值已连接 (:3333)".into(),
-                    });
-                    self.gdb = Some(gdb);
-                }
-                Err(e) => {
-                    self.emit(Event::Log {
-                        message: format!("GDB 连接失败（3 秒后重试）: {e}"),
-                    });
-                }
-            },
-            Err(e) => {
+        self.gdb_attempting = true;
+        self.gdb_retry_at = Instant::now() + gdb_backoff(self.gdb_fail_count);
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.gdb_result_rx = Some(rx);
+        let spawn_res = std::thread::Builder::new()
+            .name("gdb-eval-connect".into())
+            .spawn(move || {
+                // gdb server 端口：OpenOCD cfg 默认 gdb_port 3333；cfg 显式改过时
+                // 需在 cfg 中保持 3333 或后续经协议下发（当前协议未传，维持原版行为）
+                let res = debug_core::gdb_mi::GdbEvaluator::spawn(&gdb_path)
+                    .and_then(|mut g| g.connect(&elf_path, 3333).map(|_| g));
+                let _ = tx.send(res);
+            });
+        if spawn_res.is_err() {
+            self.gdb_attempting = false;
+            self.gdb_result_rx = None;
+        }
+    }
+
+    /// 非阻塞回收 GDB 启动结果；每次引擎循环调用一次。
+    fn poll_gdb_result(&mut self) {
+        let Some(rx) = self.gdb_result_rx.as_ref() else { return };
+        match rx.try_recv() {
+            Ok(Ok(gdb)) => {
+                self.gdb = Some(gdb);
+                self.gdb_result_rx = None;
+                self.gdb_attempting = false;
+                self.gdb_fail_count = 0;
                 self.emit(Event::Log {
-                    message: format!("GDB 启动失败: {e}"),
+                    message: "GDB 表达式求值已连接 (:3333)".into(),
                 });
+            }
+            Ok(Err(e)) => {
+                self.gdb_result_rx = None;
+                self.gdb_attempting = false;
+                self.gdb_fail_count += 1;
+                self.gdb_retry_at = Instant::now() + gdb_backoff(self.gdb_fail_count);
+                self.emit(Event::Log {
+                    message: format!(
+                        "GDB 连接失败（{} 秒后重试）: {e}",
+                        gdb_backoff(self.gdb_fail_count).as_secs()
+                    ),
+                });
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.gdb_result_rx = None;
+                self.gdb_attempting = false;
             }
         }
     }

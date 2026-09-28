@@ -83,7 +83,9 @@ class ScopePanel(private val project: Project) : JBPanel<ScopePanel>(BorderLayou
     private val settings get() = org.embedded.monitor.settings.EmbeddedMonitorSettings.getInstance(project)
 
     // 顶部控制条（极简紧凑图标化，适配 1/4 屏幕空间）
-    private val freqSpinner = JSpinner(SpinnerNumberModel(100.0, 1.0, 50000.0, 10.0))
+    // 上限 5000 与引擎侧钳制（monitor SetScopeFreq clamp 1..5000）及设置页一致；
+    // 引擎对更高请求会静默钳到 5000，UI 不应展示一个达不到的范围
+    private val freqSpinner = JSpinner(SpinnerNumberModel(100.0, 1.0, 5000.0, 10.0))
     private val followButton = JToggleButton("", true)
     private val autoRangeButton = JToggleButton("", true)
     private val gridButton = JToggleButton("", true)
@@ -136,7 +138,9 @@ class ScopePanel(private val project: Project) : JBPanel<ScopePanel>(BorderLayou
         val numEditor = JSpinner.NumberEditor(freqSpinner, "#")
         freqSpinner.editor = numEditor
         numEditor.textField.columns = 5
-        freqSpinner.value = settings.scopeFreqHz
+        // 历史配置可能存有 >5000 的值（旧版上限 50000、引擎静默钳 5000）：
+        // 钳回模型范围内，避免 spinner 显示越界值后无法用步进按钮回调
+        freqSpinner.value = settings.scopeFreqHz.coerceIn(1.0, 5000.0)
 
         add(buildControls(), BorderLayout.NORTH)
         add(waveform, BorderLayout.CENTER)
@@ -241,7 +245,7 @@ class ScopePanel(private val project: Project) : JBPanel<ScopePanel>(BorderLayou
 
         freqSpinner.preferredSize = Dimension(JBUI.scale(85), JBUI.scale(22))
         freqSpinner.minimumSize = Dimension(JBUI.scale(75), JBUI.scale(22))
-        freqSpinner.toolTipText = "采样频率（1-50000 Hz）"
+        freqSpinner.toolTipText = "采样频率（1-5000 Hz，引擎实际上限受单帧读内存耗时约束）"
 
         exportButton.icon = AllIcons.ToolbarDecorator.Export
         exportButton.toolTipText = "导出 CSV"
@@ -668,7 +672,8 @@ class ScopePanel(private val project: Project) : JBPanel<ScopePanel>(BorderLayou
         }
         yMenu.add(JMenuItem("自适应此通道范围 (Fit Channel Range)").apply {
             addActionListener {
-                val series = service.scopeSnapshot()[variable.address]
+                // 单通道轻量快照：scopeSnapshot() 在版本变化时全通道整份克隆
+                val series = service.scopeSeriesSnapshot(variable.address)
                 val valid = series?.map { it.value }?.filter { !it.isNaN() && !it.isInfinite() }
                 if (valid.isNullOrEmpty()) {
                     Messages.showInfoMessage(project, "该通道暂无有效采样数据", "自适应范围")
@@ -828,24 +833,39 @@ class ScopePanel(private val project: Project) : JBPanel<ScopePanel>(BorderLayou
     }
 
     private fun exportCsv() {
-        val vars = service.scopeVariables.toList()
-        val snapshot = service.scopeSnapshot()
-        if (vars.isEmpty() || snapshot.isEmpty()) {
-            Messages.showInfoMessage(project, "暂无数据可导出。", "导出 CSV")
-            return
+        // 快照克隆必须挪出 EDT：scopeSnapshot() 在版本变化时对全通道整份克隆
+        // （50k×通道数），与 refreshWaveform 的 snapshotInFlight 池化处理同理。
+        // 流程：pooled 取快照 → EDT 弹文件框 → pooled 写文件
+        ApplicationManager.getApplication().executeOnPooledThread {
+            val vars = service.scopeVariables.toList()
+            val snapshot = service.scopeSnapshot()
+            if (vars.isEmpty() || snapshot.isEmpty()) {
+                com.intellij.util.ui.UIUtil.invokeLaterIfNeeded {
+                    Messages.showInfoMessage(project, "暂无数据可导出。", "导出 CSV")
+                }
+                return@executeOnPooledThread
+            }
+            com.intellij.util.ui.UIUtil.invokeLaterIfNeeded {
+                val chooser = javax.swing.JFileChooser()
+                chooser.dialogTitle = "导出 CSV"
+                chooser.selectedFile = java.io.File("scope_data.csv")
+                if (chooser.showSaveDialog(this) != javax.swing.JFileChooser.APPROVE_OPTION) return@invokeLaterIfNeeded
+                val path = chooser.selectedFile.path.let { if (it.endsWith(".csv", true)) it else "$it.csv" }
+                writeCsvPooled(vars, snapshot, path)
+            }
         }
-        val chooser = javax.swing.JFileChooser()
-        chooser.dialogTitle = "导出 CSV"
-        chooser.selectedFile = java.io.File("scope_data.csv")
-        if (chooser.showSaveDialog(this) != javax.swing.JFileChooser.APPROVE_OPTION) return
-        val path = chooser.selectedFile.path.let { if (it.endsWith(".csv", true)) it else "$it.csv" }
+    }
 
-        val rows = snapshot.values.maxOfOrNull { it.size } ?: 0
-        val span = service.scopeBufferSpanSec()
-        val rate = service.scopeBufferRateHz()
-
+    private fun writeCsvPooled(
+        vars: List<ScopeVariable>,
+        snapshot: Map<Long, List<ScopeSample>>,
+        path: String,
+    ) {
         ApplicationManager.getApplication().executeOnPooledThread {
             try {
+                val rows = snapshot.values.maxOfOrNull { it.size } ?: 0
+                val span = service.scopeBufferSpanSec()
+                val rate = service.scopeBufferRateHz()
                 val cleanSnapshot = snapshot.mapValues { (addr, series) ->
                     val v = vars.firstOrNull { it.address == addr }
                     if (v != null) org.embedded.monitor.core.TornSampleFilter.repairSeries(series, v.format) else series

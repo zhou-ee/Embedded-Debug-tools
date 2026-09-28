@@ -148,7 +148,9 @@ impl DebugBackend for ProbeRsBackend {
         // 必须逐个尝试，不能盲选 probes[0]
         let (mut probe, ident) = crate::probe::open_first_available()
             .map_err(BackendError::ConnectionLost)?;
-        let _ = probe.set_speed(self.speed_hz / 1000);
+        // 亚 kHz 输入整除得 0，set_speed(0) 无效且错误被吞，最终静默用探针默认
+        // 速率、与 Connected 事件报告的 "@0kHz" 自相矛盾——钳到 1kHz
+        let _ = probe.set_speed((self.speed_hz / 1000).max(1));
         tracing::debug!("使用探针 {ident}");
 
         // attach（非复位附加，对照原版 connect_mode="attach"）
@@ -285,7 +287,16 @@ impl DebugBackend for ProbeRsBackend {
                 let len = match core.memory_regions().find(|r| r.contains(*addr)) {
                     Some(r) => {
                         let avail = (r.address_range().end - addr) as usize;
-                        (*len).min(avail)
+                        if avail < *len {
+                            // 与 read_bytes 的显式报错策略一致：静默截断会让
+                            // extract_from_blocks 因数据不足把该目标从所有样本
+                            // 中静默丢弃（示波目标贴 RAM 顶端时正是配错地址，
+                            // 最需要报错的场景）
+                            return Err(BackendError::Transfer(format!(
+                                "采样范围 0x{addr:08x}+{len}B 越出区域末尾（仅剩 {avail}B），已拒绝下发"
+                            )));
+                        }
+                        *len
                     }
                     None if (PPB_LO..PPB_HI).contains(addr) => *len,
                     None if (PERIPH_LO..PERIPH_HI).contains(addr) => *len,

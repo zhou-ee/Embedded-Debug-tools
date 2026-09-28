@@ -22,11 +22,16 @@ use std::time::Duration;
 /// 同步读内存的超时与上限（对齐 src-tauri 的 monitor_read_mem）
 const READ_MEM_TIMEOUT: Duration = Duration::from_secs(2);
 const READ_MEM_MAX: usize = 64 * 1024;
+/// 同步写内存超时：正常 <10ms；给满 2s 覆盖引擎忙于示波突发的窗口
+const WRITE_MEM_TIMEOUT: Duration = Duration::from_secs(2);
 /// 单行请求长度上限：超限视为协议错误并断开。elf_load 的变量树下发由
 /// agent → 插件方向承载，上行请求（targets 列表等）远小于此值
 const MAX_LINE_LEN: usize = 4 * 1024 * 1024;
 /// 引擎收尾（清 DWT/断点、resume、断开 probe）的等待上限
 const ENGINE_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
+/// 僵尸泵线程的再等待上限（engine_connect 拉起新引擎前）。3s + 7s = 10s，
+/// 仍在插件的 connect 请求超时（12s）之内
+const ZOMBIE_REAP_TIMEOUT: Duration = Duration::from_secs(7);
 
 pub struct SharedState {
     /// 最近已知目标状态
@@ -47,6 +52,10 @@ pub struct Session {
     scope_freq: Mutex<Option<f64>>,
     watch_targets: Mutex<Option<Vec<MemTarget>>>,
     scope_targets: Mutex<Option<Vec<ScopeTarget>>>,
+    /// 收尾超时未能退出的旧泵线程句柄：engine_connect 拉起新引擎前再等，
+    /// 此前超时即 detach 后照常 spawn，新旧引擎并存抢占同一 USB probe，
+    /// 且旧引擎"清 DWT/断点并 resume"的收尾被整段丢弃
+    zombie_pumps: Mutex<Vec<std::thread::JoinHandle<()>>>,
 }
 
 impl Session {
@@ -64,14 +73,18 @@ impl Session {
             scope_freq: Mutex::new(None),
             watch_targets: Mutex::new(None),
             scope_targets: Mutex::new(None),
+            zombie_pumps: Mutex::new(Vec::new()),
         }
     }
 
     /// connect：关闭旧引擎，重启新引擎并派泵线程（对齐 src-tauri monitor_start 行为）。
-    fn engine_connect(&self, params: ConnectParams) {
+    /// Err = 旧引擎尚未退出（被慢操作阻塞）——此时新引擎必然抢不到 probe，
+    /// 明确报错由插件侧监督重连稍后重试，绝不带病双开。
+    fn engine_connect(&self, params: ConnectParams) -> Result<(), String> {
         // 先等旧引擎完全收尾（shutdown_engine 内 join 泵线程），避免新旧引擎
         // 短暂并存抢占同一 USB probe
         self.shutdown_engine();
+        self.reap_zombie_pumps()?;
         let handle = monitor::spawn_engine();
         let cmd_tx = handle.cmd_tx.clone();
         *self.cmd_slot.lock() = Some(cmd_tx.clone());
@@ -97,6 +110,33 @@ impl Session {
             let _ = cmd_tx.send(Command::UpdateScopeTargets(targets));
         }
         let _ = cmd_tx.send(Command::Connect(params));
+        Ok(())
+    }
+
+    /// 等待僵尸泵线程退出；宽限期内仍活着则报错（本次 connect 拒绝执行）。
+    fn reap_zombie_pumps(&self) -> Result<(), String> {
+        let mut zombies = self.zombie_pumps.lock();
+        let deadline = std::time::Instant::now() + ZOMBIE_REAP_TIMEOUT;
+        while !zombies.is_empty() {
+            // 已退出的就地 join 收割（引擎 panic 已被 catch_unwind，join 不会炸）；
+            // JoinHandle::join 按值消费，用 partition 而非 retain
+            let (finished, running): (Vec<_>, Vec<_>) = zombies.drain(..).partition(|h| h.is_finished());
+            for h in finished {
+                let _ = h.join();
+            }
+            *zombies = running;
+            if zombies.is_empty() {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(
+                    "旧监视引擎尚未退出（正被阻塞操作占用，探针未释放），本次连接已取消；请稍后重试"
+                        .to_string(),
+                );
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        Ok(())
     }
 
     pub fn shutdown_engine(&self) {
@@ -115,10 +155,13 @@ impl Session {
             if handle.is_finished() {
                 let _ = handle.join();
             } else {
+                // 超时不丢弃句柄：挂入僵尸表，engine_connect 拉起新引擎前再等一程，
+                // 仍不退出则拒绝新连接（探针还在旧引擎手里，新引擎开 probe 必失败）
                 eprintln!(
-                    "[agent] 引擎收尾等待超时（{:?}），放弃等待（可能遗留 DWT/断点配置）",
+                    "[agent] 引擎收尾等待超时（{:?}），转入僵尸表继续等待（可能遗留 DWT/断点配置）",
                     ENGINE_SHUTDOWN_TIMEOUT
                 );
+                self.zombie_pumps.lock().push(handle);
             }
         }
     }
@@ -165,10 +208,6 @@ impl Session {
                     eprintln!("[agent] 读取失败（{e}），断开连接");
                     break;
                 }
-            }
-            if line.len() > MAX_LINE_LEN {
-                eprintln!("[agent] 单行请求超长（>{} 字节），断开连接", MAX_LINE_LEN);
-                break;
             }
             eprintln!("[agent] recv: {}", line.trim().chars().take(80).collect::<String>());
             let line = line.trim().to_string();
@@ -219,7 +258,7 @@ impl Session {
                 if params.kind == BackendKind::Openocd && params.attach_only {
                     check_openocd_attachable(params.tcl_port)?;
                 }
-                self.engine_connect(params);
+                self.engine_connect(params)?;
                 self.send(response_ok(id, Value::Null));
             }
             "disconnect" => {
@@ -288,8 +327,24 @@ impl Session {
                     return Err(format!("data 超出上限 {READ_MEM_MAX} 字节"));
                 }
                 validate_mem_range(addr, data.len() as u64)?;
-                self.send_cmd(Command::WriteMem { addr, data })?;
-                self.send(response_ok(id, Value::Null));
+                // 请求-应答语义：写失败（探针未连接/地址不可写）必须回错误——
+                // 此前发完命令立即回 ok，写入结果在引擎侧被丢弃，插件端误报成功
+                let cmd_tx = self
+                    .cmd_slot
+                    .lock()
+                    .clone()
+                    .ok_or("引擎未启动，先调用 connect")?;
+                let (reply_tx, reply_rx) = bounded(1);
+                let _ = cmd_tx.send(Command::WriteMemSync {
+                    addr,
+                    data,
+                    reply: reply_tx,
+                });
+                match reply_rx.recv_timeout(WRITE_MEM_TIMEOUT) {
+                    Ok(Ok(())) => self.send(response_ok(id, Value::Null)),
+                    Ok(Err(e)) => return Err(e),
+                    Err(_) => return Err("写内存超时（引擎忙或未连接）".to_string()),
+                }
             }
             "check_bandwidth" => {
                 let targets: Vec<(u64, u64)> = serde_json::from_value(
@@ -311,22 +366,35 @@ impl Session {
                 self.elf_load_async(id, PathBuf::from(path));
             }
             "elf_resolve" => {
-                let expr = p.get("expr").and_then(Value::as_str).ok_or("缺少 expr")?;
-                let cache = &self.shared.elf_cache;
-                let path = cache.loaded_path().ok_or("尚未加载 ELF，先调用 elf_load")?;
-                let index = cache.get(&path)?;
-                let node = index.resolve_member_chain(expr);
-                self.send(response_ok(id, serde_json::to_value(node).unwrap_or(Value::Null)));
+                let expr = p
+                    .get("expr")
+                    .and_then(Value::as_str)
+                    .ok_or("缺少 expr")?
+                    .to_string();
+                let path = self
+                    .shared
+                    .elf_cache
+                    .loaded_path()
+                    .ok_or("尚未加载 ELF，先调用 elf_load")?;
+                // 缓存未命中时 ElfIndex::load 需数百毫秒，异步执行避免读循环停摆
+                self.elf_query_async(id, path, move |index| {
+                    let node = index.resolve_member_chain(&expr);
+                    serde_json::to_value(node).map_err(|e| format!("序列化失败: {e}"))
+                });
             }
             "elf_type_at_addr" => {
                 let addr = p.get("addr").and_then(Value::as_u64).ok_or("缺少 addr")?;
-                let cache = &self.shared.elf_cache;
-                let path = cache.loaded_path().ok_or("尚未加载 ELF，先调用 elf_load")?;
-                let index = cache.get(&path)?;
-                let t = index.type_at_addr(addr).map(|(type_name, size, encoding)| {
-                    json!({"typeName": type_name, "size": size, "encoding": encoding})
+                let path = self
+                    .shared
+                    .elf_cache
+                    .loaded_path()
+                    .ok_or("尚未加载 ELF，先调用 elf_load")?;
+                self.elf_query_async(id, path, move |index| {
+                    let t = index.type_at_addr(addr).map(|(type_name, size, encoding)| {
+                        json!({"typeName": type_name, "size": size, "encoding": encoding})
+                    });
+                    serde_json::to_value(t).map_err(|e| format!("序列化失败: {e}"))
                 });
-                self.send(response_ok(id, serde_json::to_value(t).unwrap_or(Value::Null)));
             }
             other => {
                 return Err(format!("未知方法: {other}"));
@@ -361,6 +429,32 @@ impl Session {
             }
             Ok(Err(e)) => Err(e),
             Err(_) => Err("读内存超时（引擎忙或未连接）".into()),
+        }
+    }
+
+    /// ELF 查询（elf_resolve / elf_type_at_addr）异步化：缓存未命中时
+    /// ElfIndex::load 需数百毫秒，此前在读循环线程同步执行，期间所有请求
+    /// （含 ping / read_mem）无响应，客户端超时误判 agent 死亡。
+    fn elf_query_async<F>(&self, id: u64, path: PathBuf, f: F)
+    where
+        F: FnOnce(&elf_info::ElfIndex) -> Result<Value, String> + Send + 'static,
+    {
+        let writer = self.writer.clone();
+        let shared = self.shared.clone();
+        let spawned = std::thread::Builder::new()
+            .name("agent-elf-query".into())
+            .spawn(move || {
+                let resp = match shared.elf_cache.get(&path) {
+                    Ok(index) => match f(&index) {
+                        Ok(v) => response_ok(id, v),
+                        Err(e) => response_err(id, e),
+                    },
+                    Err(e) => response_err(id, e),
+                };
+                let _ = writer.send(resp);
+            });
+        if spawned.is_err() {
+            self.send(response_err(id, "elf 查询线程创建失败"));
         }
     }
 

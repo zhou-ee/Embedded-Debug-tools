@@ -28,11 +28,25 @@ impl GdbEvaluator {
             cmd.creation_flags(0x08000000);
         }
         let mut child = cmd.spawn().map_err(|e| format!("启动 GDB 失败: {e}"))?;
-        let stdin = child.stdin.take().ok_or("GDB stdin 不可用")?;
-        let stdout = child.stdout.take().ok_or("GDB stdout 不可用")?;
+        let stdin = match child.stdin.take() {
+            Some(s) => s,
+            None => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err("GDB stdin 不可用".to_string());
+            }
+        };
+        let stdout = match child.stdout.take() {
+            Some(s) => s,
+            None => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err("GDB stdout 不可用".to_string());
+            }
+        };
 
         let (tx, rx) = channel::<String>();
-        std::thread::Builder::new()
+        let reader_thread = std::thread::Builder::new()
             .name("gdb-mi-reader".into())
             .spawn(move || {
                 let reader = BufReader::new(stdout);
@@ -46,8 +60,13 @@ impl GdbEvaluator {
                         Err(_) => break,
                     }
                 }
-            })
-            .map_err(|e| e.to_string())?;
+            });
+        if let Err(e) = reader_thread {
+            // Drop Child 不会杀进程，读线程创建失败必须显式收割
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!("GDB 读线程创建失败: {e}"));
+        }
 
         Ok(Self {
             child,

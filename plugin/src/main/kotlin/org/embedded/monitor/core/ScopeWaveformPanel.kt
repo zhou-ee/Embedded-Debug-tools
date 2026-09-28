@@ -477,6 +477,8 @@ class ScopeWaveformPanel : JPanel() {
     private var cachedEarliestNanos: Long = Long.MAX_VALUE
 
     private fun recomputeTimeExtremes() {
+        // 逐点全扫（而非取首尾）是刻意为之：面板需容忍乱序时间戳数据
+        // （见 testTimestampDisorderLatestTimeResilience），不能假设严格单调
         var latest = Long.MIN_VALUE
         var earliest = Long.MAX_VALUE
         for (series in data.values) {

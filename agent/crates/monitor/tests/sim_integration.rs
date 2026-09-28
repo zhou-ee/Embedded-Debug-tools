@@ -160,11 +160,14 @@ fn full_debug_flow_with_sim_backend() {
     }
 
     // 6. 写内存 → 同步读回
-    tx.send(Command::WriteMem {
+    let (wtx, wrx) = crossbeam_channel::bounded(1);
+    tx.send(Command::WriteMemSync {
         addr: SIG + 0x1000,
         data: vec![0xAA, 0xBB, 0xCC],
+        reply: wtx,
     })
     .unwrap();
+    wrx.recv_timeout(Duration::from_secs(3)).unwrap().unwrap();
     let (rtx, rrx) = crossbeam_channel::bounded(1);
     tx.send(Command::ReadMemSync {
         addr: SIG + 0x1000,

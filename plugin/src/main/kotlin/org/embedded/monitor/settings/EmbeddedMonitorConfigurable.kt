@@ -103,7 +103,8 @@ class EmbeddedMonitorConfigurable(private val project: Project) : Configurable {
         autoSwitchCheck.isSelected = s.autoSwitchBackendOnDebug
         pauseOnBpCheck.isSelected = s.pausePollingOnBreakpoint
         speedSpinner.value = s.speedHz
-        freqSpinner.value = s.scopeFreqHz
+        // 历史配置可能存有 >5000 的值（旧示波面板上限 50000，引擎钳 5000）：钳回范围内
+        freqSpinner.value = s.scopeFreqHz.coerceIn(1.0, 5000.0)
         watchFreqCombo.selectedItem = "${EmbeddedMonitorSettings.snapWatchFreq(s.watchRefreshFreq)} Hz"
         elfOverrideField.text = s.elfOverride
         elfAutoCheck.isSelected = s.elfAuto
@@ -158,6 +159,11 @@ class EmbeddedMonitorConfigurable(private val project: Project) : Configurable {
     override fun reset() {
         applyFromSettings()
         refreshDetectedLabelAsync()
+    }
+
+    override fun disposeUIResources() {
+        // 设置页关闭后释放全部 Swing 组件引用，避免持有 spinner/面板图
+        panel = null
     }
 
     /** 从 CLion 的 OpenOCD 运行配置预填充 board-config。 */

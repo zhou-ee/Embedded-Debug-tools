@@ -1,7 +1,7 @@
 //! OpenOCD 后端：子进程管理 + Tcl RPC（端口 6666，Ctrl+Z 帧协议）。
 //! 移植原版 core/backend.py 的 OpenOCDClient / OpenOCDBackend。
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
@@ -78,6 +78,9 @@ impl OpenOcdBackend {
                 cmd.arg("-s").arg(scripts);
             }
         }
+        // 必须把 tcl_port 下发给子进程：cfg 默认 6666，而等待循环按 self.tcl_port
+        // 轮询——不下发时用户改过 tcl_port 就陷入"拉起→轮询超时→杀掉"死循环
+        cmd.arg("-c").arg(format!("tcl_port {}", self.tcl_port));
         cmd.stdout(Stdio::null())
             .stderr(Stdio::null())
             .stdin(Stdio::null());
@@ -112,19 +115,29 @@ impl OpenOcdBackend {
         for _ in 0..50 {
             std::thread::sleep(Duration::from_millis(60));
             // openocd 若启动即退出（cfg 错误/探针被占），快速失败而不是等满轮询
-            if let Some(Ok(Some(status))) = self.child.as_mut().map(|c| c.try_wait()) {
-                return Err(BackendError::ConnectionLost(format!(
-                    "OpenOCD 启动即退出（退出码 {:?}；检查 cfg 与探针是否被占用）",
-                    status.code()
-                )));
+            match self.child.as_mut().map(|c| c.try_wait()) {
+                Some(Ok(Some(status))) => {
+                    return Err(BackendError::ConnectionLost(format!(
+                        "OpenOCD 启动即退出（退出码 {:?}；检查 cfg 与探针是否被占用）",
+                        status.code()
+                    )));
+                }
+                // try_wait 本身出错（如 fd 异常）继续空转 50×60ms 毫无意义，直接报错
+                Some(Err(e)) => {
+                    return Err(BackendError::ConnectionLost(format!(
+                        "OpenOCD 状态查询失败: {e}"
+                    )));
+                }
+                _ => {}
             }
             if self.try_connect_tcl().is_ok() {
                 return Ok(());
             }
         }
-        Err(BackendError::ConnectionLost(
-            "OpenOCD Tcl 端口 (6666) 等待超时".into(),
-        ))
+        Err(BackendError::ConnectionLost(format!(
+            "OpenOCD Tcl 端口 ({}) 等待超时",
+            self.tcl_port
+        )))
     }
 
     /// 发送 Tcl 命令并读取响应（Ctrl+Z 结尾帧）。
@@ -151,18 +164,21 @@ impl OpenOcdBackend {
     fn tcl_recv(&mut self) -> Result<String, BackendError> {
         let stream = self.stream.as_mut().ok_or(BackendError::NotConnected)?;
         let mut out = Vec::new();
-        match stream.read_until(FRAME, &mut out) {
+        // take() 封顶读入长度：read_until 本身无界，若帧错位导致数据流持续
+        // 不含 0x1a，内存会无界增长到连接关闭；超限即按连接丢失重建
+        let mut limited = stream.by_ref().take(4 * 1024 * 1024 + 1);
+        match limited.read_until(FRAME, &mut out) {
             Ok(0) => {
                 self.stream = None;
                 return Err(BackendError::ConnectionLost("Tcl 连接关闭".into()));
             }
             Ok(_) => {
-                if out.last() == Some(&FRAME) {
-                    out.pop();
-                }
                 if out.len() > 4 * 1024 * 1024 {
                     self.stream = None;
                     return Err(BackendError::ConnectionLost("Tcl 响应过大".into()));
+                }
+                if out.last() == Some(&FRAME) {
+                    out.pop();
                 }
             }
             Err(e) => {
@@ -236,8 +252,8 @@ impl DebugBackend for OpenOcdBackend {
         // 确认可用
         self.tcl("poll")?;
         // SWD 时钟：引擎的 speed_hz（kHz）。此前 OpenOCD 后端从不设置速度，
-        // 只用 cfg 里的默认值
-        let _ = self.tcl(&format!("adapter speed {}", self.speed_hz / 1000));
+        // 只用 cfg 里的默认值。亚 kHz 输入整除得 0，adapter speed 0 无效——钳到 1kHz
+        let _ = self.tcl(&format!("adapter speed {}", (self.speed_hz / 1000).max(1)));
         // 关键静音保护：OpenOCD 默认会将所有通过 Tcl RPC 执行的命令结果（通过 LOG_USER）
         // 打印到自身 stdout/stderr，这会导致 CLion 的 OpenOCD 控制台被周期性轮询（curstate / read_memory）
         // 疯狂刷屏（例如持续弹出 running / halted / 0x42c6fd72）。
@@ -499,6 +515,10 @@ impl DebugBackend for OpenOcdBackend {
                     }
                 }
                 let resp = self.tcl(&format!("read_memory 0x{addr:x} 8 {len}"))?;
+                // 8-bit 回退路径同样必须查带内错误：错误文本直接喂给
+                // parse_number_tokens 得到空 Vec，样本被静默丢弃、避让/限流
+                // 机制完全绕过（与 read_bytes 主路径策略一致）
+                check_inband_error(&resp)?;
                 frame.push(parse_number_tokens(&resp));
             }
             out.push((start.elapsed(), frame));

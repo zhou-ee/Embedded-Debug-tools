@@ -249,11 +249,14 @@ fn main() {
 
         // 写内存 → 读回
         let scratch: u64 = 0x2000_0800;
-        tx.send(Command::WriteMem {
+        let (wtx, wrx) = crossbeam_channel::bounded(1);
+        tx.send(Command::WriteMemSync {
             addr: scratch,
             data: vec![0xDE, 0xAD, 0xBE, 0xEF],
+            reply: wtx,
         })
         .unwrap();
+        wrx.recv_timeout(Duration::from_secs(3)).unwrap().unwrap();
         std::thread::sleep(Duration::from_millis(300));
         let (rtx, rrx) = crossbeam_channel::bounded(1);
         tx.send(Command::ReadMemSync {

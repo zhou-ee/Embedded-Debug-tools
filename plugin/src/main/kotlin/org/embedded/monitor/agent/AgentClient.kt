@@ -145,15 +145,30 @@ class AgentClient(
     private class ReadyInfo(val port: Int, val proto: Int, val token: String?)
 
     private fun readReadyInfo(stdout: BufferedReader): ReadyInfo {
-        // 就绪行有 5s 宽限（agent 绑定端口应当是毫秒级）
+        // 就绪行有 5s 宽限（agent 绑定端口应当是毫秒级）。
+        // 不能直接 readLine()：agent 卡住不输出时它会**无限期阻塞**，
+        // deadline 检查永远走不到，调用线程永久挂死、进程无人回收——
+        // 改为有界轮询 + 缓冲区拼行，超时/EOF 立即失败
         val deadline = System.currentTimeMillis() + 5000
+        val buf = CharArray(512)
+        val pendingChars = StringBuilder()
         while (System.currentTimeMillis() < deadline) {
-            val line = stdout.readLine() ?: break
-            val trimmed = line.trim()
-            if (trimmed.startsWith("CLION_AGENT_READY")) {
-                val port = Regex("port=(\\d+)").find(trimmed)?.groupValues?.get(1)?.toInt() ?: continue
-                val proto = Regex("proto=(\\d+)").find(trimmed)?.groupValues?.get(1)?.toInt() ?: 0
-                val token = Regex("token=([0-9a-zA-Z]+)").find(trimmed)?.groupValues?.get(1)
+            if (!stdout.ready()) {
+                Thread.sleep(20)
+                continue
+            }
+            val n = stdout.read(buf)
+            if (n < 0) break // EOF：agent 提前退出
+            pendingChars.append(buf, 0, n)
+            while (true) {
+                val nl = pendingChars.indexOf('\n')
+                if (nl < 0) break
+                val line = pendingChars.substring(0, nl).trim()
+                pendingChars.deleteRange(0, nl + 1)
+                if (!line.startsWith("CLION_AGENT_READY")) continue
+                val port = Regex("port=(\\d+)").find(line)?.groupValues?.get(1)?.toInt() ?: continue
+                val proto = Regex("proto=(\\d+)").find(line)?.groupValues?.get(1)?.toInt() ?: 0
+                val token = Regex("token=([0-9a-zA-Z]+)").find(line)?.groupValues?.get(1)
                 return ReadyInfo(port, proto, token)
             }
         }
@@ -175,19 +190,25 @@ class AgentClient(
                 }
                 when {
                     obj.has("event") -> {
-                        val name = obj.get("event").asString
-                        val data = obj.getAsJsonObject("data") ?: JsonObject()
-                        if (name == "engine") {
-                            try {
+                        // 字段访问（asString/asJsonObject）也要守住"单行丢弃"的意图：
+                        // 畸形行抛出的 ClassCastException 落到外层会误判死整条连接
+                        try {
+                            val name = obj.get("event").asString
+                            val data = obj.getAsJsonObject("data") ?: JsonObject()
+                            if (name == "engine") {
                                 onEngineEvent(EngineEventParser.parse(data))
-                            } catch (e: Exception) {
-                                log.warn("事件解析失败", e)
                             }
+                        } catch (e: Exception) {
+                            log.warn("忽略无法解析的 agent 事件行: ${line.take(200)}", e)
                         }
                     }
                     obj.has("id") -> {
-                        val id = obj.get("id").asLong
-                        pending.remove(id)?.complete(obj)
+                        try {
+                            val id = obj.get("id").asLong
+                            pending.remove(id)?.complete(obj)
+                        } catch (e: Exception) {
+                            log.warn("忽略无法解析的 agent 响应行: ${line.take(200)}", e)
+                        }
                     }
                 }
             }
