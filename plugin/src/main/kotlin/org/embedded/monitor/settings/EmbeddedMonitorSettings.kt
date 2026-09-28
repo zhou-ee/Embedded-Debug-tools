@@ -10,6 +10,8 @@ import com.intellij.util.xmlb.annotations.XCollection
 data class PersistedWatchItem(
     var expr: String = "",
     var autoRefresh: Boolean = true,
+    /** CLion 求值型监视（无法解析为地址的 C 表达式，断点暂停时由 IDE 调试器求值） */
+    var evalOnly: Boolean = false,
 )
 
 /** 示波通道持久化。 */

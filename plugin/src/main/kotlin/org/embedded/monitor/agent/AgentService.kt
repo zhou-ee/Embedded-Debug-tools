@@ -78,6 +78,109 @@ class AgentService(private val project: Project) : Disposable {
         java.util.concurrent.ConcurrentHashMap<com.intellij.xdebugger.XDebugSession, Boolean>()
     )
 
+    // ---------- CLion 原生求值（XDebuggerEvaluator，复用 IDE 自己的 GDB） ----------
+    /** 当前调试会话的求值器：仅断点暂停期有意义；会话结束即置空 */
+    @Volatile private var clionEvaluator: com.intellij.xdebugger.evaluation.XDebuggerEvaluator? = null
+    @Volatile private var clionEvalSession: com.intellij.xdebugger.XDebugSession? = null
+
+    /** CLion 原生求值是否可用（调试会话激活且调试进程暴露了求值器）。 */
+    fun clionEvalAvailable(): Boolean = clionEvaluator != null
+
+    /**
+     * 经 CLion 原生调试器求值表达式（复用 IDE 自己的 GDB，进程内 API 调用）。
+     * 仅在目标暂停时有意义；结果回调可能在任意线程，onResult 保证至多触发一次。
+     * 求值失败/超时回调 null（超时兜底 [CLION_EVAL_TIMEOUT_MS]）。
+     */
+    fun evaluateViaClion(expr: String, onResult: (String?) -> Unit) {
+        val evaluator = clionEvaluator
+        if (evaluator == null) {
+            onResult(null)
+            return
+        }
+        val delivered = java.util.concurrent.atomic.AtomicBoolean(false)
+        fun deliver(v: String?) {
+            if (delivered.compareAndSet(false, true)) onResult(v)
+        }
+        // 超时兜底：会话中途退出等场景回调可能永不抵达
+        val timeout = supervisor.schedule({
+            deliver(null)
+        }, clionEvalTimeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS)
+        ApplicationManager.getApplication().invokeLater {
+            try {
+                evaluator.evaluate(expr, object : com.intellij.xdebugger.evaluation.XDebuggerEvaluator.XEvaluationCallback {
+                    override fun evaluated(result: com.intellij.xdebugger.frame.XValue) {
+                        timeout.cancel(false)
+                        deliver(extractXValueText(result))
+                    }
+
+                    override fun errorOccurred(errorMessage: String) {
+                        timeout.cancel(false)
+                        deliver("<求值失败: $errorMessage>")
+                    }
+                }, null)
+            } catch (t: Throwable) {
+                timeout.cancel(false)
+                log.warn("CLion 求值调用失败: $expr", t)
+                deliver(null)
+            }
+        }
+    }
+
+    /**
+     * 从 XValue 提取渲染后的值文本：字符串值直取；其余走 XValueNode 捕获
+     * （computePresentation 可能异步完成，用闩锁等待至多 2s）。
+     */
+    private fun extractXValueText(value: com.intellij.xdebugger.frame.XValue): String? = runCatching {
+        val captured = StringBuilder()
+        val done = java.util.concurrent.CountDownLatch(1)
+        val node = object : com.intellij.xdebugger.frame.XValueNode {
+            override fun setPresentation(icon: javax.swing.Icon?, type: String?, value: String, hasChildren: Boolean) {
+                captured.append(value)
+                done.countDown()
+            }
+
+            override fun setPresentation(
+                icon: javax.swing.Icon?,
+                presentation: com.intellij.xdebugger.frame.presentation.XValuePresentation,
+                hasChildren: Boolean,
+            ) {
+                runCatching {
+                    presentation.renderValue(object : com.intellij.xdebugger.frame.presentation.XValuePresentation.XValueTextRenderer {
+                        override fun renderValue(text: String) { captured.append(text) }
+                        override fun renderStringValue(text: String) { captured.append(text) }
+                        override fun renderNumericValue(text: String) { captured.append(text) }
+                        override fun renderKeywordValue(text: String) { captured.append(text) }
+                        override fun renderValue(text: String, key: com.intellij.openapi.editor.colors.TextAttributesKey) { captured.append(text) }
+                        override fun renderStringValue(text: String, extra: String?, maxLength: Int) { captured.append(text) }
+                        override fun renderComment(text: String) { captured.append(text) }
+                        override fun renderSpecialSymbol(text: String) { captured.append(text) }
+                        override fun renderError(text: String) { captured.append(text) }
+                    })
+                }
+                done.countDown()
+            }
+
+            override fun setFullValueEvaluator(fullValueEvaluator: com.intellij.xdebugger.frame.XFullValueEvaluator) {}
+            override fun isObsolete(): Boolean = false
+        }
+        value.computePresentation(node, com.intellij.xdebugger.frame.XValuePlace.TREE)
+        done.await(2, java.util.concurrent.TimeUnit.SECONDS)
+        captured.toString().trim().ifEmpty { null }
+    }.getOrNull()
+
+    /** 对全部 evalOnly 监视项执行一轮 CLion 求值并刷新 UI（断点暂停时调用）。 */
+    private fun refreshEvalOnlyItems() {
+        val items = synchronized(watchItems) { watchItems.filter { it.evalOnly } }
+        for (item in items) {
+            evaluateViaClion(item.expr) { result ->
+                if (result != null) {
+                    item.evalValue = result
+                    watchDataListeners.forEach { runCatching { it() } }
+                }
+            }
+        }
+    }
+
     // ---------- ELF ----------
     @Volatile var elfPath: String? = null
         private set
@@ -222,6 +325,9 @@ class AgentService(private val project: Project) : Disposable {
     }
     private val reconnectAttempts = java.util.concurrent.atomic.AtomicInteger(0)
     @Volatile private var connectWatchdog: java.util.concurrent.ScheduledFuture<*>? = null
+
+    /** CLion 原生求值的超时兜底（回调未抵达时置空结果，避免监视项永久停在"…"） */
+    private val clionEvalTimeoutMs: Long get() = 8000
 
     private fun cancelConnectWatchdog() {
         connectWatchdog?.cancel(false)
@@ -671,6 +777,13 @@ class AgentService(private val project: Project) : Disposable {
         if (!attachedSessions.add(session)) return
         registerLiveWatchDebugTab(session)
         registerRegisterDebugTab(session)
+        // 捕获 CLion 原生调试器的求值器（即 IDE 自己的 GDB）：evalOnly 型监视项
+        // 在断点暂停时经它求值——不新起 GDB、不占用 3333 端口、无与调试器抢目标的问题
+        runCatching { session.debugProcess.evaluator }.getOrNull()?.let {
+            clionEvaluator = it
+            clionEvalSession = session
+            logLine("CLion 原生求值器已就绪（复杂表达式断点期求值可用）")
+        }
         // 监听器挂会话级 Disposable：此前 parent 为工程级 service，会话结束后
         // 注册节点（持有 session 强引用）不注销，反复启停调试会话逐次累积。
         // 会话正常结束时在 sessionStopped 主动 dispose；工程关闭时作为 service
@@ -694,6 +807,10 @@ class AgentService(private val project: Project) : Disposable {
 
             override fun sessionStopped() {
                 attachedSessions.remove(session)
+                if (clionEvalSession === session) {
+                    clionEvaluator = null
+                    clionEvalSession = null
+                }
                 runCatching {
                     val ui = session.ui
                     ui?.findContent(LIVE_WATCH_DEBUG_CONTENT_ID)?.let { c ->
@@ -788,6 +905,10 @@ class AgentService(private val project: Project) : Disposable {
 
     private fun handleDebugProcessStopped(process: com.intellij.xdebugger.XDebugProcess) {
         attachedSessions.remove(process.session)
+        if (clionEvalSession === process.session) {
+            clionEvaluator = null
+            clionEvalSession = null
+        }
         onDebugSessionStopped(process.session)
     }
 
@@ -815,6 +936,8 @@ class AgentService(private val project: Project) : Disposable {
                 sampleWatchOnceOnPause()
             }
         }
+        // evalOnly 型监视项（复杂 C 表达式）：借 CLion 原生调试器求值
+        refreshEvalOnlyItems()
     }
 
     private fun onDebugSessionBeforeResume(session: com.intellij.xdebugger.XDebugSession) {
@@ -1724,7 +1847,29 @@ class AgentService(private val project: Project) : Disposable {
                             "或在设置 → Embedded Monitor 中指定 ELF 路径（工程构建一次后重试）。",
                     )
                 }
-                val item = resolveWatchBlocking(trimmed)
+                val item = try {
+                    resolveWatchBlocking(trimmed)
+                } catch (e: Exception) {
+                    // ELF 已加载仍无法解析为内存地址（强转/函数调用等复杂 C 表达式）
+                    // 且 CLion 调试会话在线：回退为 CLion 求值型监视，断点暂停时由
+                    // IDE 原生 GDB 求值。ELF 未加载等环境性问题不回退，保持报错
+                    if (elfLoaded && clionEvalAvailable()) {
+                        notify(
+                            "「$trimmed」无法解析为内存地址，已添加为 CLion 求值型监视（断点暂停时刷新）",
+                            com.intellij.notification.NotificationType.INFORMATION,
+                        )
+                        WatchItem(
+                            id = WatchValueFormatter.nextWatchId(),
+                            expr = trimmed,
+                            address = 0,
+                            size = 0,
+                            encoding = "eval",
+                            typeName = "CLion eval",
+                        ).apply { evalOnly = true }
+                    } else {
+                        throw e
+                    }
+                }
                 item.autoRefresh = autoRefresh
                 val dup = watchItems.firstOrNull { it.expr.equals(item.expr, ignoreCase = true) }
                 if (dup != null) {
@@ -1735,6 +1880,10 @@ class AgentService(private val project: Project) : Disposable {
                 watchItems.add(item)
                 pushWatchTargets()
                 persistWatches()
+                // 已处于断点暂停态时，求值型监视项立即出值（否则要等下一次断点）
+                if (item.evalOnly && isHaltedByDebug) {
+                    refreshEvalOnlyItems()
+                }
                 future.complete(item)
             } catch (e: Exception) {
                 future.completeExceptionally(e)
@@ -2293,8 +2442,9 @@ class AgentService(private val project: Project) : Disposable {
 
     private fun persistWatches() {
         settings.update { s ->
-            s.watchItems = watchItems.map { org.embedded.monitor.settings.PersistedWatchItem(it.expr, it.autoRefresh) }
-                .toMutableList()
+            s.watchItems = watchItems.map {
+                org.embedded.monitor.settings.PersistedWatchItem(it.expr, it.autoRefresh, it.evalOnly)
+            }.toMutableList()
         }
     }
 
@@ -2315,6 +2465,22 @@ class AgentService(private val project: Project) : Disposable {
         val s = settings.state
         for (w in s.watchItems) {
             if (watchItems.none { it.expr == w.expr }) {
+                if (w.evalOnly) {
+                    // CLion 求值型监视：无地址，不走 ELF 解析，直接恢复
+                    val item = WatchItem(
+                        id = WatchValueFormatter.nextWatchId(),
+                        expr = w.expr,
+                        address = 0,
+                        size = 0,
+                        encoding = "eval",
+                        typeName = "CLion eval",
+                    ).apply {
+                        evalOnly = true
+                        autoRefresh = w.autoRefresh
+                    }
+                    watchItems.add(item)
+                    continue
+                }
                 runCatching { resolveWatchBlocking(w.expr) }.getOrNull()?.let { item ->
                     item.autoRefresh = w.autoRefresh
                     watchItems.add(item)

@@ -344,6 +344,32 @@ class LiveWatchTreeCellRenderer @JvmOverloads constructor(
 
         // 2. 节点图标与彩色文本
         colored.clear()
+        // CLion 求值型监视项：无内存地址，展示 IDE 调试器求值结果
+        if (data.isTop && data.entry.evalOnly) {
+            colored.icon = AllIcons.Debugger.EvaluateExpression
+            colored.append(treeNode.name, SimpleTextAttributes.REGULAR_ATTRIBUTES)
+            colored.append("  ⟦CLion 求值⟧", SimpleTextAttributes.GRAY_ATTRIBUTES)
+            colored.append(" = ", SimpleTextAttributes.REGULAR_ATTRIBUTES)
+            val v = data.entry.evalValue
+            when {
+                v == null -> colored.append(
+                    if (service?.engineState == "halted") "…" else "待断点求值",
+                    SimpleTextAttributes.GRAYED_ATTRIBUTES,
+                )
+                v.startsWith("<") -> colored.append(v, SimpleTextAttributes.ERROR_ATTRIBUTES)
+                else -> colored.append(v, SimpleTextAttributes.REGULAR_ATTRIBUTES)
+            }
+            panel.toolTipText = "${data.expr} · 由 CLion 原生调试器求值（复用 IDE 的 GDB），仅断点暂停时刷新"
+            if (selected) {
+                panel.isOpaque = true
+                panel.background = UIUtil.getTreeSelectionBackground(hasFocus)
+                colored.foreground = UIUtil.getTreeSelectionForeground(hasFocus)
+            } else {
+                panel.isOpaque = false
+                colored.foreground = tree.foreground
+            }
+            return panel
+        }
         colored.icon = when {
             treeNode.isPointer -> AllIcons.Nodes.Annotationtype
             treeNode.isComposite -> AllIcons.Nodes.Class
@@ -904,7 +930,8 @@ class LiveWatchPanel(private val project: Project) :
     private fun promptAddExpression() {
         val expr = Messages.showInputDialog(
             project,
-            "支持：符号名 / a.b.c 成员链 / float @ 0x20000000 / 0x20000000:u32",
+            "支持：符号名 / a.b.c 成员链 / float @ 0x20000000 / 0x20000000:u32\n" +
+                "复杂 C 表达式（强转/函数调用）：调试会话中自动由 CLion 原生调试器在断点暂停时求值",
             "添加实时变量监视",
             null,
         )?.trim() ?: return

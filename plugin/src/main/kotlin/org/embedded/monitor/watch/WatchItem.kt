@@ -22,6 +22,14 @@ data class WatchItem(
 ) {
     var node: SymbolNode? = null
 
+    /** CLion 求值型监视：无法解析为内存地址的 C 表达式（强转/函数调用等），
+     *  由 CLion 原生调试器（XDebuggerEvaluator，即 IDE 自己的 GDB）在断点暂停时求值。
+     *  无地址、不参与 watch 内存目标下发（doPushWatchTargets 的地址过滤天然排除）。 */
+    var evalOnly: Boolean = false
+
+    /** 最近一次 CLion 求值结果文本（null = 尚未求值）。 */
+    @Transient var evalValue: String? = null
+
     constructor(
         id: String,
         expr: String,
