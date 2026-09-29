@@ -3,6 +3,22 @@
 > **路径映射说明**：V1.2.x 历史条目中的 `software_ref/` 对应本仓库现在的 `agent/`，
 > `package_release.py` 对应 `package.py`（项目在开源重构前为 software_ref 单体工程）。
 
+## [V1.2.19] — 修复：CLion 求值型监视在真实调试会话中不生效
+
+> **用户真机实测发现（2026-09-29）**：`pyro::wl_chassis_t::instance()` 在 CLion 原生
+> Watches 可求值，但实时监视添加框报"添加监视失败: 无法解析表达式"——evalOnly 回退未触发。
+
+### Plugin (V1.2.19)
+- **求值器捕获改为按需惰性获取（根因修复）**：V1.2.18 在 `processStarted` 瞬间一次性
+  捕获 `XDebugProcess.getEvaluator()`，而该时刻 CIDR 调试进程常尚未初始化、返回 null，
+  此后永不重试 → `clionEvalAvailable()` 恒 false → 复杂表达式全部走裸 ELF 解析报错。
+  改为每次调用时从存活调试会话现场获取并缓存；
+- **可诊断报错**：有调试会话但求值器仍不可用时，报"CLion 原生求值器不可用（调试器
+  初始化中或未暴露求值器；请稍后重试或重启调试会话）"而非裸解析错误。
+
+### Agent (v1.2.19)
+- 版本同步 v1.2.19（仅版本号联动，无行为变更）。
+
 ## [V1.2.18] — CLion 原生 GDB 求值接入（复杂表达式断点期求值）+ 审查遗留修复批次
 
 ### Plugin (V1.2.18)

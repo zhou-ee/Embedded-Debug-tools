@@ -84,7 +84,23 @@ class AgentService(private val project: Project) : Disposable {
     @Volatile private var clionEvalSession: com.intellij.xdebugger.XDebugSession? = null
 
     /** CLion 原生求值是否可用（调试会话激活且调试进程暴露了求值器）。 */
-    fun clionEvalAvailable(): Boolean = clionEvaluator != null
+    fun clionEvalAvailable(): Boolean = currentClionEvaluator() != null
+
+    /**
+     * 取当前调试会话的 CLion 原生求值器（带缓存）。
+     * **必须按需重试**：processStarted 瞬间 CIDR 的 getEvaluator() 常返回 null
+     * （调试进程尚在初始化），一次性捕获会让 evalOnly 回退永久失效
+     * （真机实测 2026-09-29：`pyro::wl_chassis_t::instance()` 添加监视报
+     * "无法解析表达式"）。改为每次调用时从存活会话现场获取并缓存。
+     */
+    private fun currentClionEvaluator(): com.intellij.xdebugger.evaluation.XDebuggerEvaluator? {
+        clionEvaluator?.let { return it }
+        val session = attachedSessions.firstOrNull() ?: return null
+        return runCatching { session.debugProcess?.evaluator }.getOrNull()?.also {
+            clionEvaluator = it
+            clionEvalSession = session
+        }
+    }
 
     /**
      * 经 CLion 原生调试器求值表达式（复用 IDE 自己的 GDB，进程内 API 调用）。
@@ -92,7 +108,7 @@ class AgentService(private val project: Project) : Disposable {
      * 求值失败/超时回调 null（超时兜底 [CLION_EVAL_TIMEOUT_MS]）。
      */
     fun evaluateViaClion(expr: String, onResult: (String?) -> Unit) {
-        val evaluator = clionEvaluator
+        val evaluator = currentClionEvaluator()
         if (evaluator == null) {
             onResult(null)
             return
@@ -1871,6 +1887,12 @@ class AgentService(private val project: Project) : Disposable {
                             encoding = "eval",
                             typeName = "CLion eval",
                         ).apply { evalOnly = true }
+                    } else if (elfLoaded && attachedSessions.isNotEmpty()) {
+                        // 有调试会话但求值器仍不可用：给出可行动的诊断而非裸解析错误
+                        throw IllegalStateException(
+                            "「$trimmed」无法解析为内存地址，且 CLion 原生求值器不可用" +
+                                "（调试器初始化中或未暴露求值器；请稍后重试或重启调试会话）", e,
+                        )
                     } else {
                         throw e
                     }
