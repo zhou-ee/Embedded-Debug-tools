@@ -121,6 +121,12 @@ class LiveWatchTreeNode(val data: WatchNodeData) : DefaultMutableTreeNode(data) 
     var isNullPtr: Boolean = false
     var pointerAddress: Long? = null
     var physicalAddress: Long = 0L
+
+    // CLion 求值子树专用（entry.evalOnly 为真时）：子节点的平台 XValue（嵌套展开）
+    // 与呈现文本由懒展开填充；顶层节点的值文本在 entry.evalValue
+    var evalXValue: Any? = null
+    var evalValueText: String? = null
+    var evalTypeText: String? = null
 }
 
 /**
@@ -344,13 +350,21 @@ class LiveWatchTreeCellRenderer @JvmOverloads constructor(
 
         // 2. 节点图标与彩色文本
         colored.clear()
-        // CLion 求值型监视项：无内存地址，展示 IDE 调试器求值结果
-        if (data.isTop && data.entry.evalOnly) {
+        // CLion 求值型监视子树：无内存地址，展示 IDE 调试器求值结果。
+        // 顶层显示表达式与求值文本；懒展开的子节点显示成员名与各自呈现文本
+        if (data.entry.evalOnly) {
             colored.icon = AllIcons.Debugger.EvaluateExpression
-            colored.append(treeNode.name, SimpleTextAttributes.REGULAR_ATTRIBUTES)
-            colored.append("  ⟦CLion 求值⟧", SimpleTextAttributes.GRAY_ATTRIBUTES)
+            colored.append(treeNode.name, if (data.isTop) SimpleTextAttributes.REGULAR_ATTRIBUTES else SimpleTextAttributes.REGULAR_ATTRIBUTES)
+            if (data.isTop) {
+                colored.append("  ⟦CLion 求值⟧", SimpleTextAttributes.GRAY_ATTRIBUTES)
+            }
+            val v = if (data.isTop) data.entry.evalValue else treeNode.evalValueText
+            if (!data.isTop) {
+                treeNode.evalTypeText?.let {
+                    colored.append(" {$it}", SimpleTextAttributes.GRAY_ATTRIBUTES)
+                }
+            }
             colored.append(" = ", SimpleTextAttributes.REGULAR_ATTRIBUTES)
-            val v = data.entry.evalValue
             when {
                 v == null -> colored.append(
                     if (service?.engineState == "halted") "…" else "待断点求值",
@@ -359,7 +373,11 @@ class LiveWatchTreeCellRenderer @JvmOverloads constructor(
                 v.startsWith("<") -> colored.append(v, SimpleTextAttributes.ERROR_ATTRIBUTES)
                 else -> colored.append(v, SimpleTextAttributes.REGULAR_ATTRIBUTES)
             }
-            panel.toolTipText = "${data.expr} · 由 CLion 原生调试器求值（复用 IDE 的 GDB），仅断点暂停时刷新"
+            panel.toolTipText = if (data.isTop) {
+                "${data.expr} · 由 CLion 原生调试器求值（复用 IDE 的 GDB），仅断点暂停时刷新；结构体/指针类结果可展开"
+            } else {
+                "${treeNode.name} · ${treeNode.evalTypeText ?: ""} · 由 CLion 原生调试器求值"
+            }
             if (selected) {
                 panel.isOpaque = true
                 panel.background = UIUtil.getTreeSelectionBackground(hasFocus)
@@ -592,6 +610,54 @@ class LiveWatchPanel(private val project: Project) :
         tree.rowHeight = JBUI.scale(22)
         tree.selectionModel.selectionMode = TreeSelectionModel.SINGLE_TREE_SELECTION
         tree.cellRenderer = LiveWatchTreeCellRenderer(service) { watchRefreshFreq }
+
+        // CLion 求值型节点懒展开：展开时经平台 computeChildren 拉取子项
+        // （结构体/指针类求值结果可逐层下钻），插入后通知模型刷新
+        tree.addTreeWillExpandListener(object : javax.swing.event.TreeWillExpandListener {
+            override fun treeWillExpand(e: javax.swing.event.TreeExpansionEvent) {
+                val node = e.path.lastPathComponent as? LiveWatchTreeNode ?: return
+                if (!node.data.entry.evalOnly) return
+                if (node.childCount > 0) return
+                val xv = node.evalXValue ?: node.data.entry.evalXValue ?: return
+                ApplicationManager.getApplication().executeOnPooledThread {
+                    val kids = service.computeEvalChildren(xv) ?: return@executeOnPooledThread
+                    val built = kids.mapNotNull { (name, childX) ->
+                        val pres = org.embedded.monitor.agent.ClionEvalBridge.capturePresentation(
+                            childX as com.intellij.xdebugger.frame.XValue,
+                        )
+                        if (pres == null) return@mapNotNull null
+                        LiveWatchTreeNode(
+                            WatchNodeData(
+                                entryId = node.data.entryId,
+                                expr = name,
+                                node = org.embedded.monitor.agent.SymbolNode(
+                                    name = name,
+                                    typeName = pres.typeText ?: "",
+                                    address = 0,
+                                    size = 0,
+                                    encoding = "eval",
+                                ),
+                                fullPath = "${node.data.fullPath}.$name",
+                                isTop = false,
+                                autoRefresh = false,
+                                entry = node.data.entry,
+                            )
+                        ).apply {
+                            evalXValue = childX
+                            evalValueText = pres.valueText
+                            evalTypeText = pres.typeText
+                        }
+                    }
+                    com.intellij.util.ui.UIUtil.invokeLaterIfNeeded {
+                        if (com.intellij.openapi.util.Disposer.isDisposed(this@LiveWatchPanel)) return@invokeLaterIfNeeded
+                        for (c in built) node.add(c)
+                        treeModel.nodeStructureChanged(node)
+                    }
+                }
+            }
+
+            override fun treeWillCollapse(e: javax.swing.event.TreeExpansionEvent) {}
+        })
 
         tree.emptyText.text = "尚未添加变量监视"
         tree.emptyText.appendSecondaryText(

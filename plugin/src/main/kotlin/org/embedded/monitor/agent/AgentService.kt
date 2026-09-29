@@ -104,98 +104,88 @@ class AgentService(private val project: Project) : Disposable {
 
     /**
      * 经 CLion 原生调试器求值表达式（复用 IDE 自己的 GDB，进程内 API 调用）。
-     * 仅在目标暂停时有意义；结果回调可能在任意线程，onResult 保证至多触发一次。
-     * 求值失败/超时回调 null（超时兜底 [CLION_EVAL_TIMEOUT_MS]）。
+     * 仅在目标暂停时有意义；回调保证至多触发一次：
+     * 成功 → (XValue, null)——文本呈现/子项展开经 [ClionEvalBridge] 由调用方按需捕获；
+     * 失败 → (null, 错误文本)；求值器不可用/超时 → (null, null)。
      */
-    fun evaluateViaClion(expr: String, onResult: (String?) -> Unit) {
+    fun evaluateViaClion(expr: String, onResult: (value: Any?, error: String?) -> Unit) {
         val evaluator = currentClionEvaluator()
         if (evaluator == null) {
-            onResult(null)
+            onResult(null, null)
             return
         }
         val delivered = java.util.concurrent.atomic.AtomicBoolean(false)
-        fun deliver(v: String?) {
-            if (delivered.compareAndSet(false, true)) onResult(v)
+        fun deliver(v: Any?, err: String?) {
+            if (delivered.compareAndSet(false, true)) onResult(v, err)
         }
         // 超时兜底：会话中途退出等场景回调可能永不抵达
         val timeout = supervisor.schedule({
-            deliver(null)
+            deliver(null, null)
         }, clionEvalTimeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS)
         ApplicationManager.getApplication().invokeLater {
             try {
                 evaluator.evaluate(expr, object : com.intellij.xdebugger.evaluation.XDebuggerEvaluator.XEvaluationCallback {
                     override fun evaluated(result: com.intellij.xdebugger.frame.XValue) {
                         timeout.cancel(false)
-                        deliver(extractXValueText(result))
+                        deliver(result, null)
                     }
 
                     override fun errorOccurred(errorMessage: String) {
                         timeout.cancel(false)
-                        deliver("<求值失败: $errorMessage>")
+                        deliver(null, "求值失败: $errorMessage")
+                    }
+
+                    override fun invalidExpression(errorMessage: String) {
+                        // CIDR 会对无法作为代码片段解析的表达式走此分支（默认实现是
+                        // no-op，V1.2.19 里曾让结果静默超时显示"…"）
+                        timeout.cancel(false)
+                        deliver(null, "表达式无效: $errorMessage")
                     }
                 }, null)
             } catch (t: Throwable) {
                 timeout.cancel(false)
                 log.warn("CLion 求值调用失败: $expr", t)
-                deliver(null)
+                deliver(null, null)
             }
         }
     }
-
-    /**
-     * 从 XValue 提取渲染后的值文本：字符串值直取；其余走 XValueNode 捕获
-     * （computePresentation 可能异步完成，用闩锁等待至多 2s）。
-     */
-    private fun extractXValueText(value: com.intellij.xdebugger.frame.XValue): String? = runCatching {
-        val captured = StringBuilder()
-        val done = java.util.concurrent.CountDownLatch(1)
-        val node = object : com.intellij.xdebugger.frame.XValueNode {
-            override fun setPresentation(icon: javax.swing.Icon?, type: String?, value: String, hasChildren: Boolean) {
-                captured.append(value)
-                done.countDown()
-            }
-
-            override fun setPresentation(
-                icon: javax.swing.Icon?,
-                presentation: com.intellij.xdebugger.frame.presentation.XValuePresentation,
-                hasChildren: Boolean,
-            ) {
-                runCatching {
-                    presentation.renderValue(object : com.intellij.xdebugger.frame.presentation.XValuePresentation.XValueTextRenderer {
-                        override fun renderValue(text: String) { captured.append(text) }
-                        override fun renderStringValue(text: String) { captured.append(text) }
-                        override fun renderNumericValue(text: String) { captured.append(text) }
-                        override fun renderKeywordValue(text: String) { captured.append(text) }
-                        override fun renderValue(text: String, key: com.intellij.openapi.editor.colors.TextAttributesKey) { captured.append(text) }
-                        override fun renderStringValue(text: String, extra: String?, maxLength: Int) { captured.append(text) }
-                        override fun renderComment(text: String) { captured.append(text) }
-                        override fun renderSpecialSymbol(text: String) { captured.append(text) }
-                        override fun renderError(text: String) { captured.append(text) }
-                    })
-                }
-                done.countDown()
-            }
-
-            override fun setFullValueEvaluator(fullValueEvaluator: com.intellij.xdebugger.frame.XFullValueEvaluator) {}
-            override fun isObsolete(): Boolean = false
-        }
-        value.computePresentation(node, com.intellij.xdebugger.frame.XValuePlace.TREE)
-        done.await(2, java.util.concurrent.TimeUnit.SECONDS)
-        captured.toString().trim().ifEmpty { null }
-    }.getOrNull()
 
     /** 对全部 evalOnly 监视项执行一轮 CLion 求值并刷新 UI（断点暂停时调用）。 */
     private fun refreshEvalOnlyItems() {
         val items = synchronized(watchItems) { watchItems.filter { it.evalOnly } }
         for (item in items) {
-            evaluateViaClion(item.expr) { result ->
-                if (result != null) {
-                    item.evalValue = result
-                    watchDataListeners.forEach { runCatching { it() } }
+            evaluateViaClion(item.expr) { value, error ->
+                // 闩锁等待放后台线程，结果回填后统一刷新 UI
+                ApplicationManager.getApplication().executeOnPooledThread {
+                    when {
+                        value != null -> {
+                            val pres = ClionEvalBridge.capturePresentation(
+                                value as com.intellij.xdebugger.frame.XValue,
+                            )
+                            item.evalXValue = value
+                            item.evalValue = when {
+                                pres == null -> "<CLion 求值结果获取超时>"
+                                else -> buildString {
+                                    pres.typeText?.let { append("{$it} ") }
+                                    append(pres.valueText ?: "")
+                                }.trim().ifEmpty { "<空值>" }
+                            }
+                        }
+                        error != null -> item.evalValue = "<$error>"
+                        else -> item.evalValue = "<求值超时或求值器不可用>"
+                    }
+                    com.intellij.util.ui.UIUtil.invokeLaterIfNeeded {
+                        watchDataListeners.forEach { runCatching { it() } }
+                    }
                 }
             }
         }
     }
+
+    /** 展开 CLion 求值型节点的第一层子项（LiveWatch 树懒展开用）。 */
+    fun computeEvalChildren(value: Any): List<Pair<String, Any>>? =
+        ClionEvalBridge.computeChildren(value as com.intellij.xdebugger.frame.XValue)?.map { it.name to (it.value as Any) }
+
 
     // ---------- ELF ----------
     @Volatile var elfPath: String? = null

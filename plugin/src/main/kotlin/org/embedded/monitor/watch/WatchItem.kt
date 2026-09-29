@@ -30,6 +30,9 @@ data class WatchItem(
     /** 最近一次 CLion 求值结果文本（null = 尚未求值）。 */
     @Transient var evalValue: String? = null
 
+    /** 最近一次求值返回的平台 XValue（供树懒展开子项；@Transient 不参与序列化）。 */
+    @Transient var evalXValue: Any? = null
+
     constructor(
         id: String,
         expr: String,

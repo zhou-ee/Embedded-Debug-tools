@@ -3,6 +3,25 @@
 > **路径映射说明**：V1.2.x 历史条目中的 `software_ref/` 对应本仓库现在的 `agent/`，
 > `package_release.py` 对应 `package.py`（项目在开源重构前为 software_ref 单体工程）。
 
+## [V1.2.20] — 求值结果呈现修复 + 结构体/指针结果懒展开
+
+> **用户真机二次反馈（2026-09-29）**：evalOnly 回退已生效（不再报错），但求值结果显示"…"
+> 且无法展开下钻。
+
+### Plugin (V1.2.20)
+- **"…"根因修复**：CIDR 求值回调存在第四条路径 `invalidExpression`（默认 no-op，
+  V1.2.19 未覆盖导致结果静默超时）——现已覆盖并回显原因；呈现捕获同时兼容
+  setPresentation 双重载（含 `XValuePresentation.getType()`），且修正为在 **EDT** 上发起
+  （CIDR 实现有 UI 线程断言）、闩锁等待 5s；求值失败/超时现在显示诊断文本而非静默"…"；
+- **新增结构体/指针结果懒展开**：求值结果保留平台 XValue，树节点展开时经
+  `computeChildren` 拉取子项并逐层下钻（每层懒加载，children 名称/类型/值文本经
+  同一呈现捕获管线）；新增 `ClionEvalBridge` 统一封装呈现/子项协议转换
+  （EDT 发起 + 闩锁有界等待 + setErrorMessage/tooManyChildren 全分支）；
+- 渲染器 evalOnly 分支从"仅顶层"泛化到整棵求值子树（子节点显示成员名 + 类型 + 值文本）。
+
+### Agent (v1.2.20)
+- 版本同步 v1.2.20（仅版本号联动，无行为变更）。
+
 ## [V1.2.19] — 修复：CLion 求值型监视在真实调试会话中不生效
 
 > **用户真机实测发现（2026-09-29）**：`pyro::wl_chassis_t::instance()` 在 CLion 原生
