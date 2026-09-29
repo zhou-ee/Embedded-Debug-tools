@@ -385,8 +385,26 @@ class LiveWatchTreeCellRenderer @JvmOverloads constructor(
                 v.startsWith("<") -> colored.append(v, SimpleTextAttributes.ERROR_ATTRIBUTES)
                 else -> colored.append(v, SimpleTextAttributes.REGULAR_ATTRIBUTES)
             }
+            // 混合升级：指针结果已固定地址实时监视（运行时按地址持续读取）
+            if (data.isTop && data.entry.address >= 0x1000L) {
+                val liveBytes = treeNode.cachedBytes
+                val isComposite = data.node.members.isNotEmpty()
+                if (!isComposite && liveBytes != null && liveBytes.isNotEmpty()) {
+                    val live = WatchValueFormatter.formatNativeValue(data.node, liveBytes)
+                    if (live.isNotEmpty()) {
+                        colored.append("  [实时 $live]", SimpleTextAttributes.REGULAR_ATTRIBUTES)
+                    }
+                }
+                colored.append(
+                    "  ⏱ 实时@0x%s".format(java.util.Locale.ROOT, data.entry.address),
+                    SimpleTextAttributes.GRAYED_ATTRIBUTES,
+                )
+            }
             panel.toolTipText = if (data.isTop) {
-                "${data.expr} · 由 CLion 原生调试器求值（复用 IDE 的 GDB），仅断点暂停时刷新；结构体/指针类结果可展开"
+                "${data.expr} · 由 CLion 原生调试器求值（复用 IDE 的 GDB）；" +
+                    if (data.entry.address >= 0x1000L) "已升级为固定地址实时监视，运行时持续读取 0x%s，下次断点自动重求值地址"
+                        .format(java.util.Locale.ROOT, data.entry.address)
+                    else "仅断点暂停时刷新；结构体/指针类结果可展开"
             } else {
                 "${treeNode.name} · ${treeNode.evalTypeText ?: ""} · 由 CLion 原生调试器求值"
             }
@@ -483,6 +501,7 @@ class LiveWatchPanel(private val project: Project) :
 
     private var cachedItemIds: List<String> = emptyList()
     private var cachedItemElfRevision: Long = 0
+    private var cachedEvalRevision: Long = -1
 
     private val watchDataListener: () -> Unit = {
         ApplicationManager.getApplication().invokeLater {
@@ -881,6 +900,8 @@ class LiveWatchPanel(private val project: Project) :
             if (currentItems[i].id != cachedItemIds[i]) return true
         }
         if (service.elfLoaded && cachedItemElfRevision != service.elfVariableCount().toLong()) return true
+        // 求值型混合升级（地址重定基）会改变既有条目的成员结构
+        if (cachedEvalRevision != service.watchStructureRevision) return true
         return false
     }
 
@@ -891,6 +912,7 @@ class LiveWatchPanel(private val project: Project) :
         val currentItems = service.watchItems.toList()
         cachedItemIds = currentItems.map { it.id }
         cachedItemElfRevision = service.elfVariableCount().toLong()
+        cachedEvalRevision = service.watchStructureRevision
 
         // 1. 保存当前展开的路径
         val expandedPaths = mutableSetOf<String>()

@@ -86,6 +86,11 @@ class AgentService(private val project: Project) : Disposable {
     /** CLion 原生求值是否可用（调试会话激活且调试进程暴露了求值器）。 */
     fun clionEvalAvailable(): Boolean = currentClionEvaluator() != null
 
+    /** 求值型监视的混合升级会改变既有条目的成员结构（地址重定基），递增此修订号
+     *  驱动 LiveWatch 面板 rebuildTree。 */
+    @Volatile var watchStructureRevision: Long = 0
+        private set
+
     /**
      * 取当前调试会话的 CLion 原生求值器（带缓存）。
      * **必须按需重试**：processStarted 瞬间 CIDR 的 getEvaluator() 常返回 null
@@ -164,6 +169,9 @@ class AgentService(private val project: Project) : Disposable {
                             )
                             item.evalXValue = value
                             item.evalHasChildren = pres?.hasChildren ?: true
+                            if (pres != null) {
+                                promoteEvalHybrid(item, pres)
+                            }
                             item.evalValue = when {
                                 pres == null -> "<CLion 求值结果获取超时>"
                                 else -> buildString {
@@ -186,6 +194,73 @@ class AgentService(private val project: Project) : Disposable {
     /** 展开 CLion 求值型节点的第一层子项（LiveWatch 树懒展开用）。 */
     fun computeEvalChildren(value: Any): List<Pair<String, Any>>? =
         ClionEvalBridge.computeChildren(value as com.intellij.xdebugger.frame.XValue)?.map { it.name to (it.value as Any) }
+
+    /**
+     * 混合升级：GDB 求值结果是指针（值文本含 0x 地址、类型为 T *）时，
+     * 把该固定地址升级为常规内存监视通道——运行时走现有 Tcl RPC 读取链路
+     * 实时刷新，下次断点重求值时地址随之更新。
+     *
+     * 成员布局复用 ELF 中同类型全局变量的 SymbolNode（绝对地址重定基到 A，
+     * 与 agent rebase_addresses 同一守卫：指针成员子树保持 pointee 相对不位移），
+     * 升级后 item 进入 watch 目标下发（地址过滤天然放行），展开的成员经
+     * dynamicWatchTargets 持续读取。
+     */
+    private fun promoteEvalHybrid(item: WatchItem, pres: ClionEvalBridge.Presentation) {
+        val text = pres.valueText ?: return
+        // 指针地址：取值文本中首个 0x 十六进制（CLion 指针呈现形如 0x200003e4 <symbol>）
+        val addr = Regex("0x([0-9a-fA-F]{6,8})").find(text)
+            ?.groupValues?.get(1)?.toLongOrNull(16) ?: return
+        if (addr < 0x1000L || addr > 0xFFFF_F000L) return
+        // 只处理指针类型：类型文本以 * 结尾（标量结果无可固定读取的"目标"）
+        if (pres.typeText?.endsWith("*") != true) return
+        val pointeeName = pres.typeText.removeSuffix("*").trim()
+            .removePrefix("const ").removePrefix("volatile ").trim()
+            .substringAfterLast("::").takeIf { it.isNotEmpty() } ?: return
+
+        val delta = { rootAddr: Long -> addr - rootAddr }
+        val root = elfVariables.firstOrNull { v ->
+            val tn = v.typeName.removePrefix("volatile ").removePrefix("const ").trim()
+            tn == pointeeName || tn.endsWith(" $pointeeName") || tn.substringAfterLast("::") == pointeeName
+        }
+        if (root != null && root.members.isNotEmpty() && root.address >= 0x1000L) {
+            val d = delta(root.address)
+            val node = root.copy(
+                name = item.expr,
+                address = addr,
+                members = root.members.map { rebaseCopy(it, d) },
+            )
+            item.node = node
+            item.address = addr
+            item.size = if (root.size > 0) root.size else 4
+            item.encoding = root.encoding
+            item.typeName = root.typeName.ifEmpty { pointeeName }
+            item.evalHasChildren = true
+            logLine("求值型监视「${item.expr}」已升级为固定地址实时监视 @0x${"%08X".format(addr)}（类型 $pointeeName，${node.members.size} 成员）")
+        } else {
+            // 找不到同类型全局：退化为定点标量读（默认 4 字节）
+            item.node = SymbolNode(
+                name = item.expr,
+                typeName = pointeeName,
+                address = addr,
+                size = 4,
+                encoding = "unsigned",
+            )
+            item.address = addr
+            item.size = 4
+            item.encoding = "unsigned"
+            item.typeName = pointeeName
+            item.evalHasChildren = false
+            logLine("求值型监视「${item.expr}」已升级为固定地址实时监视 @0x${"%08X".format(addr)}（标量 4B）")
+        }
+        watchStructureRevision++
+        pushWatchTargets()
+    }
+
+    /** 与 agent rebase_addresses 同一守卫：指针成员子树保持 pointee 相对，不随基址位移。 */
+    private fun rebaseCopy(n: SymbolNode, delta: Long): SymbolNode = n.copy(
+        address = n.address + delta,
+        members = if (n.isPointer) n.members else n.members.map { rebaseCopy(it, delta) },
+    )
 
 
     // ---------- ELF ----------
