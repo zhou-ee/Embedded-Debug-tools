@@ -33,6 +33,9 @@ data class WatchItem(
     /** 最近一次求值返回的平台 XValue（供树懒展开子项；@Transient 不参与序列化）。 */
     @Transient var evalXValue: Any? = null
 
+    /** 求值结果是否可能有子项（结构体/指针 true；来自呈现捕获 hasChildren；未知默认 true）。 */
+    @Transient var evalHasChildren: Boolean = true
+
     constructor(
         id: String,
         expr: String,

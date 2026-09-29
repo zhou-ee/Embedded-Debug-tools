@@ -163,6 +163,7 @@ class AgentService(private val project: Project) : Disposable {
                                 value as com.intellij.xdebugger.frame.XValue,
                             )
                             item.evalXValue = value
+                            item.evalHasChildren = pres?.hasChildren ?: true
                             item.evalValue = when {
                                 pres == null -> "<CLion 求值结果获取超时>"
                                 else -> buildString {

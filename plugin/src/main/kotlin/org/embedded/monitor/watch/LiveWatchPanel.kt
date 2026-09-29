@@ -127,6 +127,18 @@ class LiveWatchTreeNode(val data: WatchNodeData) : DefaultMutableTreeNode(data) 
     var evalXValue: Any? = null
     var evalValueText: String? = null
     var evalTypeText: String? = null
+    var evalHasChildren: Boolean = true
+
+    /**
+     * 展开手柄可见性由本方法决定（DefaultTreeModel 默认 asksAllowsChildren=false
+     * 直接查询 node.isLeaf）：ELF 节点维持原语义（无成员即叶子）；求值节点在
+     * 可能含子项时必须报告"非叶子"，否则 childCount==0 会被判为叶子、展开手柄
+     * 根本不出现（真机实测 2026-09-29：类型能显示但无法展开的根因）。
+     */
+    override fun isLeaf(): Boolean = when {
+        data.entry.evalOnly -> data.entry.evalValue == null || !evalHasChildren
+        else -> data.node.members.isEmpty()
+    }
 }
 
 /**
@@ -479,6 +491,17 @@ class LiveWatchPanel(private val project: Project) :
             // 面板的 isShowing 守卫保持一致
             if (!Disposer.isDisposed(this) && isShowing()) {
                 updateNodeBytes(rootNode)
+                // 求值型顶层节点首次拿到结果后 isLeaf 语义变化（叶子→可展开），
+                // 必须通知模型重查结构，展开手柄才会出现
+                for (i in 0 until rootNode.childCount) {
+                    val child = rootNode.getChildAt(i) as? LiveWatchTreeNode ?: continue
+                    if (child.data.entry.evalOnly && child.evalXValue == null &&
+                        child.data.entry.evalXValue != null
+                    ) {
+                        child.evalXValue = child.data.entry.evalXValue
+                        treeModel.nodeStructureChanged(child)
+                    }
+                }
                 tree.repaint()
                 updateStatusLabel(service.engineState)
             }
@@ -646,6 +669,7 @@ class LiveWatchPanel(private val project: Project) :
                             evalXValue = childX
                             evalValueText = pres.valueText
                             evalTypeText = pres.typeText
+                            evalHasChildren = pres.hasChildren
                         }
                     }
                     com.intellij.util.ui.UIUtil.invokeLaterIfNeeded {
