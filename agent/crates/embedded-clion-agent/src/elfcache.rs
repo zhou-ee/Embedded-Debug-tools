@@ -37,11 +37,14 @@ impl ElfCache {
             .canonicalize()
             .map_err(|e| format!("ELF 路径不存在: {} ({e})", path.display()))?;
         let mtime = std::fs::metadata(&canonical).ok().and_then(|m| m.modified().ok());
-        // 快路径：命中且未变，直接返回
+        // 快路径：命中且未变，直接返回。
+        // 必须同步更新 last——elf_resolve/elf_type_at_addr 以 loaded_path() 取索引，
+        // A→B→A 重新加载时若不更新，后续查询会静默地在 B 的索引上解析
         {
             let entries = self.entries.lock();
             if let Some(entry) = entries.get(&canonical) {
                 if entry.mtime == mtime {
+                    *self.last.lock() = Some(canonical);
                     return Ok(entry.index.clone());
                 }
             }

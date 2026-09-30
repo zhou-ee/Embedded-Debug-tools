@@ -465,7 +465,7 @@ impl Session {
     fn elf_load_async(&self, id: u64, path: PathBuf) {
         let writer = self.writer.clone();
         let shared = self.shared.clone();
-        std::thread::Builder::new()
+        let spawned = std::thread::Builder::new()
             .name("agent-elf-load".into())
             .spawn(move || {
                 let resp = match shared.elf_cache.get(&path) {
@@ -482,8 +482,11 @@ impl Session {
                     Err(e) => response_err(id, e),
                 };
                 let _ = writer.send(resp);
-            })
-            .expect("spawn elf load");
+            });
+        // spawn 失败回错误响应而非 panic（panic 会沿读循环线程传播致进程退出）
+        if spawned.is_err() {
+            self.send(response_err(id, "elf 加载线程创建失败"));
+        }
     }
 }
 

@@ -308,9 +308,35 @@ impl DebugBackend for ProbeRsBackend {
                         }
                         *len
                     }
-                    None if (PPB_LO..PPB_HI).contains(addr) => *len,
-                    None if (PERIPH_LO..PERIPH_HI).contains(addr) => *len,
-                    None if (EXT_RAM_LO..EXT_RAM_HI).contains(addr) => *len,
+                    // 白名单区同样做末端校验（与 read_bytes 策略一致）：跨出上界
+                    // 会让访问端口进故障态，宁可显式报错走避让
+                    None if (PPB_LO..PPB_HI).contains(addr) => {
+                        let avail = (PPB_HI - addr) as usize;
+                        if avail < *len {
+                            return Err(BackendError::Transfer(format!(
+                                "采样范围 0x{addr:08x}+{len}B 越出 PPB 区末尾（仅剩 {avail}B），已拒绝下发"
+                            )));
+                        }
+                        *len
+                    }
+                    None if (PERIPH_LO..PERIPH_HI).contains(addr) => {
+                        let avail = (PERIPH_HI - addr) as usize;
+                        if avail < *len {
+                            return Err(BackendError::Transfer(format!(
+                                "采样范围 0x{addr:08x}+{len}B 越出外设区末尾（仅剩 {avail}B），已拒绝下发"
+                            )));
+                        }
+                        *len
+                    }
+                    None if (EXT_RAM_LO..EXT_RAM_HI).contains(addr) => {
+                        let avail = (EXT_RAM_HI - addr) as usize;
+                        if avail < *len {
+                            return Err(BackendError::Transfer(format!(
+                                "采样范围 0x{addr:08x}+{len}B 越出外扩 RAM 末尾（仅剩 {avail}B），已拒绝下发"
+                            )));
+                        }
+                        *len
+                    }
                     None => {
                         return Err(BackendError::Transfer(format!(
                             "采样地址 0x{addr:08x} 不在任何已映射内存区域内，已拒绝下发"

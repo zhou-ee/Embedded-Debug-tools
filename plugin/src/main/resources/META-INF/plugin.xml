@@ -12,7 +12,8 @@
         <ul>
             <li><b>实时变量监视</b>：全局/静态变量、结构体成员链（a.b.c）、裸地址，5Hz 运行中刷新</li>
             <li><b>寄存器实时监视</b>：CMSIS-SVD 外设与寄存器树形浏览，可选刷新频率（1Hz~10Hz）与按寄存器独立动态刷新，支持位域提取</li>
-            <li><b>示波器</b>：变量高频采样（probe-rs 最高 1kHz / OpenOCD ~870Hz）、缩放/游标/CSV 导出</li>
+            <li><b>示波器</b>：变量高频采样（probe-rs / OpenOCD 实测均可达成 1kHz）、缩放/游标/CSV 导出</li>
+            <li><b>CLion 原生求值监视</b>：复杂 C 表达式（强转/函数调用）在断点期由 IDE 自带 GDB 求值，指针结果自动升级为固定地址实时监视</li>
             <li><b>符号表自动加载</b>：自动从 CLion 配置的构建路径（CMake File API / 构建目录）解析 ELF</li>
         </ul>
     ]]></description>

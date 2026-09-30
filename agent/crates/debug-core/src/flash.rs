@@ -24,7 +24,8 @@ pub enum FlashEvent {
 /// 打开 probe-rs 会话：依序尝试可用探针（可按 serial 过滤）+ 指定目标。
 pub fn open_session(target: &str, speed_hz: u32, serial: Option<&str>) -> Result<Session, String> {
     let (mut probe, _ident) = crate::probe::open_first_available(serial)?;
-    let _ = probe.set_speed(speed_hz / 1000); // set_speed 单位 kHz
+    // set_speed 单位 kHz；亚 kHz 输入整除得 0 无效，钳到 1（与 probers_backend 一致）
+    let _ = probe.set_speed((speed_hz / 1000).max(1));
     let session = if target.trim().is_empty() {
         probe
             .attach(

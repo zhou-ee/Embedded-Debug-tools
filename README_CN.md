@@ -26,6 +26,9 @@
   - 依托底层高速传输通道，采样率最高可达 **1,000Hz (1kHz)**；
   - 支持多通道波形同屏渲染、视窗水平/垂直无级缩放与拖拽、时间/幅值双光标差值测量；
   - 支持一键导出 CSV 离线原始数据集，方便 MATLAB、Python 深入分析。
+- **🧠 CLion 原生表达式求值（Evaluation Watch）**：
+  - 复杂 C 表达式（强转、函数调用如 `pyro::wl_chassis_t::instance()`）在断点期经平台 API **复用 IDE 自带的 GDB** 进程内求值——不新起 GDB、不占用 3333 端口；
+  - 指针结果**自动升级为固定地址实时监视**：求值地址在运行态按常规内存读取链路持续采样，下次断点自动重求值刷新地址。
 - **🔍 CMSIS-SVD 外设寄存器实时监视（Register Live Watch）**：
   - 高性能纯 Kotlin SVD 解析引擎，实测解析 STM32G4 完整外设定义（~2MB）耗时 < 25ms；
   - 智能外设树展示，支持每个寄存器单独勾选实时采样复选框（节约 SWD 总线带宽）；
@@ -88,10 +91,10 @@
 
 ```
 Embedded Debug tools/
-├── plugin/               # 前端 CLion 插件工程 (基于 Kotlin / IntelliJ SDK, V1.2.14)
+├── plugin/               # 前端 CLion 插件工程 (基于 Kotlin / IntelliJ SDK, V1.2.25)
 │   ├── src/main/kotlin/  # 变量监视、示波器、SVD 寄存器 UI、IPC 交互实现
 │   └── src/test/kotlin/  # 前端自动化测试集 (覆盖 110+ 项单测)
-├── agent/                # 后端 Rust Agent 工作空间 (v1.2.12)
+├── agent/                # 后端 Rust Agent 工作空间 (v1.2.25)
 │   └── crates/
 │       ├── embedded-clion-agent/ # Sidecar TCP JSON-RPC 守护进程
 │       ├── monitor/              # 高速采样引擎 (环形缓冲、1kHz 示波、节拍调度)
@@ -111,7 +114,7 @@ Embedded Debug tools/
 ## 🛠️ 安装与快速上手
 
 ### 方式一：直接安装官方预编译发布包（推荐）
-1. 在 GitHub [Releases](../../releases) 页面下载最新发布的 `embedded-debug-plugin-V1.2.14-standalone.zip`；
+1. 在 GitHub [Releases](../../releases) 页面下载最新发布的 `embedded-debug-plugin-<版本号>-standalone.zip`；
 2. 打开 CLion，进入设置 **Settings** (`Ctrl+Alt+S`) -> **Plugins** -> 点击齿轮 ⚙️ -> **Install Plugin from Disk...**；
 3. 选择下载好的 `.zip` 文件，安装后重启 CLion；
 4. *说明：Standalone 发布包已内置编译好的原生 Rust Agent，使用者无需额外安装任何 Rust 编译环境！当前内置 Agent 二进制仅支持 Windows，Linux/macOS 用户请通过方式二自行编译 Agent。*

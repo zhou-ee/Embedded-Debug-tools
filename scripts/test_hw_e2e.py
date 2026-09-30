@@ -177,8 +177,8 @@ except TimeoutError:
     check(f"probe-rs 连接 {target}", False, "30s 超时")
 
 if resp.get("ok"):
-    ev = [e for e in cli.events if e["data"].get("kind") == "engine"]
-    states = [e["data"]["data"].get("kind") for e in ev] if ev else []
+    ev = [e for e in cli.events if e.get("event") == "engine"]
+    states = [e["data"].get("kind") for e in ev] if ev else []
     print("   引擎事件:", states)
 
     # 6. 真实内存读取（SRAM 0x20000000，两读验证通道畅通）

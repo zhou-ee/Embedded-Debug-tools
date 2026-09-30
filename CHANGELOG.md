@@ -3,6 +3,40 @@
 > **路径映射说明**：V1.2.x 历史条目中的 `software_ref/` 对应本仓库现在的 `agent/`，
 > `package_release.py` 对应 `package.py`（项目在开源重构前为 software_ref 单体工程）。
 
+## [V1.2.26] — 全量独立审查修复批次
+
+> 本版为独立全量代码审查（不依赖历史结论、三路并行 + 主会话逐条复核）后的修复。
+> 审查确认此前各修复项全部落实且无回归；本轮修复新发现的 2 高 / 5 中 / 若干低危。
+
+### 高危
+- **ElfCache 快路径命中不更新 `last`**：A→B→A 重新加载后，elf_resolve/elf_type_at_addr
+  会静默在 B 的索引上解析（错误地址可进入监视目标甚至写错硬件内存）——快路径命中时
+  同步更新 `last`；
+- **求值节点懒展开竞态**：子项插入经后台线程异步落地，快速 折叠→再展开 会并发发起
+  两次 computeChildren 并重复插入同一批子项——引入节点级在飞标志 + 插入前查 disposed。
+
+### 中危
+- **条件断点"条件为假"路径补 `landed_on_breakpoint` 防护**：step_past 落点恰为另一
+  断点时不得 resume（OpenOCD 会摘掉落点断点跑过去而静默丢命中），与其余三处 resume
+  路径对齐；
+- **probe-rs scope_burst 白名单区（PPB/外设/外扩 RAM）末端校验**：跨出上界显式报错
+  走避让，与 read_bytes 策略一致；
+- **ELF 重载可见性**：reResolveWatches 就地改写后递增 `watchStructureRevision`
+  （volatile 提供发布屏障 + 驱动重建）——修复"重编译后变量数不变时 EDT 长期渲染
+  旧布局"；
+- **addWatch 回退收紧**：agent 掉线时的解析失败不再静默变成求值型监视（回退要求
+  agent 存活），故障根因不被掩盖；
+- **文档与发布物同步**：README/README_CN 移除 V1.2.14 滞后引用、修正不存在的
+  "Tcl Host" 配置项、补 CLion 原生求值功能描述；plugin.xml 修正作废的"~870Hz"
+  并补求值特性。
+
+### 低危
+- `elf_load_async` spawn 失败回错误响应而非 panic；`SetScopeFreq` NaN 防护对齐
+  SetWatchFreq；`tcl_recv` EOF 截断帧按断连重建（残缺文本不再可能被当成功）；
+  dwarf Pass1 单个畸形 DIE 不再中止整个索引；ReadMemSync 未连接时静默回错
+  （不再连发 State+Disconnected 事件）；flash `set_speed` 钳 1kHz；
+  e2e 脚本引擎事件诊断修正。
+
 ## [V1.2.25] — 修复：断点重命中时求值子树的展开状态被折叠
 
 > **用户真机反馈（2026-09-29）**：断点再次命中时，即使 GDB 求值结果不变，

@@ -1899,9 +1899,10 @@ class AgentService(private val project: Project) : Disposable {
                     resolveWatchBlocking(trimmed)
                 } catch (e: Exception) {
                     // ELF 已加载仍无法解析为内存地址（强转/函数调用等复杂 C 表达式）
-                    // 且 CLion 调试会话在线：回退为 CLion 求值型监视，断点暂停时由
-                    // IDE 原生 GDB 求值。ELF 未加载等环境性问题不回退，保持报错
-                    if (elfLoaded && clionEvalAvailable()) {
+                    // 且 agent 与 CLion 调试会话均在线：回退为 CLion 求值型监视，
+                    // 断点暂停时由 IDE 原生 GDB 求值。ELF 未加载 / agent 掉线等
+                    // 环境性问题不回退，保持原始报错（否则故障根因被静默掩盖）
+                    if (elfLoaded && agentRunning && clientRef.get() != null && clionEvalAvailable()) {
                         notify(
                             "「$trimmed」无法解析为内存地址，已添加为 CLion 求值型监视（断点暂停时刷新）",
                             com.intellij.notification.NotificationType.INFORMATION,
@@ -1914,7 +1915,7 @@ class AgentService(private val project: Project) : Disposable {
                             encoding = "eval",
                             typeName = "CLion eval",
                         ).apply { evalOnly = true }
-                    } else if (elfLoaded && attachedSessions.isNotEmpty()) {
+                    } else if (elfLoaded && agentRunning && clientRef.get() != null && attachedSessions.isNotEmpty()) {
                         // 有调试会话但求值器仍不可用：给出可行动的诊断而非裸解析错误
                         throw IllegalStateException(
                             "「$trimmed」无法解析为内存地址，且 CLion 原生求值器不可用" +
@@ -1995,6 +1996,9 @@ class AgentService(private val project: Project) : Disposable {
                 item.node = r.node
             }
         }
+        // 就地改写后必须发布：volatile 递增同时提供 happens-before（EDT 可见新布局）
+        // 与重建触发（ELF 重载后变量数不变时 elfVariableCount 判据会漏）
+        watchStructureRevision++
         pushWatchTargets()
     }
 

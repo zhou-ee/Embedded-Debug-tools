@@ -22,6 +22,9 @@
 - **⚡ High-Speed Live Variable Watch**:
   - Sample global, static, and nested struct variables in real time at **2Hz, 5Hz, 10Hz, or 15Hz** without halting the target MCU.
   - Seamless support for struct member chains (`motor.state.pos`), array indexing (`data[0].val`), and dynamic pointer dereferencing (`g_ptr->field`).
+- **🧠 CLion-Native Expression Evaluation**:
+  - Complex C expressions (casts, function calls like `pyro::wl_chassis_t::instance()`) are evaluated **in-process via the IDE's own GDB** (`XDebuggerEvaluator`) while halted at a breakpoint — no extra GDB process, no port conflicts.
+  - Pointer results are **auto-promoted to fixed-address live watches**: the evaluated address is continuously sampled at runtime through the normal memory-read path and re-resolved on the next breakpoint hit.
 - **📈 Real-Time Software Oscilloscope**:
   - Up to **1,000Hz (1kHz)** high-frequency waveform capture via probe-rs / OpenOCD Tcl RPC.
   - Multiple channels, real-time panning/zooming, dual cursor measurement, and one-click CSV export.
@@ -108,7 +111,7 @@ Embedded Debug tools/
 ## 🛠️ Quick Installation
 
 ### Option 1: Install from Prebuilt Standalone Plugin (Recommended)
-1. Download `embedded-debug-plugin-V1.2.14-standalone.zip` from [Releases](../../releases).
+1. Download the latest `embedded-debug-plugin-<version>-standalone.zip` from [Releases](../../releases).
 2. In CLion, navigate to **Settings** (`Ctrl+Alt+S`) -> **Plugins** -> ⚙️ -> **Install Plugin from Disk...**.
 3. Select the downloaded `.zip` file and restart CLion.
 4. *Note: Standalone package bundles the native `embedded-clion-agent` executable—no external Rust installation needed! The bundled agent binary is currently Windows-only; Linux/macOS users should build the agent from source (Option 2).*
@@ -167,7 +170,7 @@ Open **Settings / Preferences -> Tools -> Embedded Monitor**:
 | Setting | Description | Default |
 |---|---|---|
 | **Backend Mode** | Debug connection backend (`OpenOCD` or `probe-rs`) | `OpenOCD` |
-| **OpenOCD Tcl Host/Port** | Tcl RPC interface address and port | `127.0.0.1:6666` |
+| **OpenOCD Tcl Port** | Tcl RPC port (loopback only) | `6666` |
 | **Default Watch Rate** | Default live watch sampling frequency (2, 5, 10, 15Hz) | `5 Hz` |
 | **Custom Agent Binary** | Path to custom `embedded-clion-agent` (optional) | *Auto-detected* |
 | **Custom SVD Directory** | Custom folder containing CMSIS-SVD chip definitions | *Auto-detected* |

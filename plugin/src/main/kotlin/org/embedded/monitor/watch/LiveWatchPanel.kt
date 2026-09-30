@@ -128,6 +128,9 @@ class LiveWatchTreeNode(val data: WatchNodeData) : DefaultMutableTreeNode(data) 
     var evalValueText: String? = null
     var evalTypeText: String? = null
     var evalHasChildren: Boolean = true
+    /** 懒展开在飞标志（仅 EDT 读写）：childCount>0 守卫在异步插入落地前无效，
+     *  快速 折叠→再展开 会并发发起两次 computeChildren 并重复插入同一批子项 */
+    var evalExpandInFlight: Boolean = false
 
     /**
      * 展开手柄可见性由本方法决定（DefaultTreeModel 默认 asksAllowsChildren=false
@@ -675,7 +678,7 @@ class LiveWatchPanel(private val project: Project) :
             override fun treeWillExpand(e: javax.swing.event.TreeExpansionEvent) {
                 val node = e.path.lastPathComponent as? LiveWatchTreeNode ?: return
                 if (!node.data.entry.evalOnly) return
-                if (node.childCount > 0) return
+                if (node.childCount > 0 || node.evalExpandInFlight) return
                 // 顶层可回退到条目的 XValue；子节点必须有自身的 XValue——
                 // 否则展开标量成员会把整个结构体的子项再挂一遍（真机实测：
                 // seq 下又出现 _ctx/seq，表现为"解析成了 pyro::wl_chassis_t *"）
@@ -684,8 +687,16 @@ class LiveWatchPanel(private val project: Project) :
                 } else {
                     node.evalXValue
                 } ?: return
+                node.evalExpandInFlight = true
                 ApplicationManager.getApplication().executeOnPooledThread {
-                    val kids = service.computeEvalChildren(xv) ?: return@executeOnPooledThread
+                    if (com.intellij.openapi.util.Disposer.isDisposed(this@LiveWatchPanel)) {
+                        node.evalExpandInFlight = false
+                        return@executeOnPooledThread
+                    }
+                    val kids = service.computeEvalChildren(xv) ?: run {
+                        node.evalExpandInFlight = false
+                        return@executeOnPooledThread
+                    }
                     val built = kids.mapNotNull { (name, childX) ->
                         val pres = org.embedded.monitor.agent.ClionEvalBridge.capturePresentation(
                             childX as com.intellij.xdebugger.frame.XValue,
@@ -715,6 +726,7 @@ class LiveWatchPanel(private val project: Project) :
                         }
                     }
                     com.intellij.util.ui.UIUtil.invokeLaterIfNeeded {
+                        node.evalExpandInFlight = false
                         if (com.intellij.openapi.util.Disposer.isDisposed(this@LiveWatchPanel)) return@invokeLaterIfNeeded
                         for (c in built) node.add(c)
                         treeModel.nodeStructureChanged(node)

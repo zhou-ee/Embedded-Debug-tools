@@ -190,9 +190,15 @@ impl OpenOcdBackend {
                     self.stream = None;
                     return Err(BackendError::ConnectionLost("Tcl 响应过大".into()));
                 }
-                if out.last() == Some(&FRAME) {
-                    out.pop();
+                if out.last() != Some(&FRAME) {
+                    // EOF 截断：读到底但未见 0x1a——帧同步已破坏，残缺文本交给
+                    // 下游（halt/resume 只查关键字）会被误当成功，按断连重建
+                    self.stream = None;
+                    return Err(BackendError::ConnectionLost(
+                        "Tcl 帧未以 0x1a 终止（连接将重建）".into(),
+                    ));
                 }
+                out.pop();
             }
             Err(e) => {
                 // 超时或 IO 错误：帧同步已破坏，重建连接

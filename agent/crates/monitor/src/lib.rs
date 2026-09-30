@@ -511,7 +511,12 @@ impl Engine {
                 self.next_scope = Instant::now();
             }
             Command::SetScopeFreq(freq) => {
-                self.scope_freq = freq.clamp(1.0, 5000.0);
+                // 对齐 SetWatchFreq：非有限值回落引擎默认，防库直调注入 NaN
+                self.scope_freq = if freq.is_finite() {
+                    freq.clamp(1.0, 5000.0)
+                } else {
+                    50.0
+                };
                 self.rebuild_scope_blocks();
                 self.next_scope = Instant::now();
             }
@@ -628,18 +633,19 @@ impl Engine {
                 // 因此不要再走 on_backend_error 发全局错误事件，否则每次回溯都会往
                 // 控制台刷一条"已拒绝下发"，用户会以为出故障了。
                 // 只有致命错误（连接丢失）仍需上报并处理。
-                let outcome = match self.backend.as_mut() {
-                    None => Err(BackendError::NotConnected),
-                    Some(b) => b.read_bytes(addr, size),
-                };
-                let result = match outcome {
-                    Ok(v) => Ok(v),
-                    Err(e) if e.is_fatal() => {
-                        let msg = e.to_string();
-                        self.on_backend_error(e);
-                        Err(msg)
-                    }
-                    Err(e) => Err(e.to_string()),
+                // 未连接：直接回错给调用方，不经 on_backend_error——断开后插件的
+                // 指针回溯等仍会发 read_mem，此前每次都连发 State+Disconnected 事件
+                let result = match self.backend.as_mut() {
+                    None => Err("引擎未连接".to_string()),
+                    Some(b) => match b.read_bytes(addr, size) {
+                        Ok(v) => Ok(v),
+                        Err(e) if e.is_fatal() => {
+                            let msg = e.to_string();
+                            self.on_backend_error(e);
+                            Err(msg)
+                        }
+                        Err(e) => Err(e.to_string()),
+                    },
                 };
                 let _ = reply.send(result);
             }
@@ -1153,13 +1159,19 @@ impl Engine {
             match self.eval_condition(&bp.condition) {
                 Ok(true) => {}
                 Ok(false) => {
-                    // 条件为假：跳过断点继续跑
+                    // 条件为假：跳过断点继续跑。
+                    // step_past 落点恰为另一断点时不得 resume——OpenOCD 会摘掉
+                    // 落点断点跑过去而静默丢命中（与 resume_over_breakpoint/
+                    // step_over/step_out 三处防护对齐）；landed_on_breakpoint 已置
+                    // 停机边沿，下一轮 poll 在新 PC 上正常上报命中
                     self.step_past_breakpoint(bp.addr & !1);
-                    // 与 Resume/Reset/step_out 路径对齐：只有 resume 实际成功才置
-                    // running 边沿——Transfer 失败时目标仍停着，发假 Running 会让
-                    // 下次 poll 出假边沿重报同一次停住
-                    if self.with_backend(|b| b.resume()).is_some() {
-                        self.mark_running();
+                    if !self.landed_on_breakpoint(None) {
+                        // 与 Resume/Reset 路径对齐：只有 resume 实际成功才置
+                        // running 边沿——Transfer 失败时目标仍停着，发假 Running
+                        // 会让下次 poll 出假边沿重报同一次停住
+                        if self.with_backend(|b| b.resume()).is_some() {
+                            self.mark_running();
+                        }
                     }
                     return;
                 }

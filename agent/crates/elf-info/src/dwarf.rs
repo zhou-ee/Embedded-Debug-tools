@@ -262,7 +262,8 @@ pub(crate) fn index_dwarf<'a>(
                         }
                 }
                 gimli::DW_TAG_subprogram => {
-                    let low_pc = match entry.attr_value(gimli::DW_AT_low_pc)? {
+                    // .ok() 容错对齐同文件其余读取：单个畸形 DIE 不中止整个索引
+                    let low_pc = match entry.attr_value(gimli::DW_AT_low_pc).ok().flatten() {
                         Some(AttributeValue::Addr(a)) => Some(a),
                         _ => None,
                     };
