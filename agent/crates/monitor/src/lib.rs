@@ -272,6 +272,11 @@ struct Engine {
     next_scope_flush: Instant,
     /// 示波读块缓存（targets/freq 变化时重建，避免每次采样重算合并）
     scope_blocks: Vec<bandwidth::MemBlock>,
+    /// 重建后的预热丢弃窗：目标/频率变更后该时刻之前的帧整体丢弃。探针 Core
+    /// 初始化 + 首次访问处于预热期——真机实测预热垃圾可持续超出单个突发
+    /// （第二帧仍异常：不同地址返回相同值/符号位翻转假值），按时间窗丢弃
+    /// 与采样率无关
+    scope_discard_until: Option<Instant>,
     /// 命中停住后挂起的断点地址（防重复上报）
     held_break_addr: Option<u64>,
     /// 步进用临时断点（停住后清除）
@@ -314,6 +319,7 @@ impl Engine {
             scope_buffer: Vec::new(),
             next_scope_flush: now,
             scope_blocks: Vec::new(),
+            scope_discard_until: None,
             held_break_addr: None,
             temp_bps: Vec::new(),
             // 空文本与任何错误都不同，首条错误必然放行
@@ -1406,6 +1412,9 @@ impl Engine {
     }
 
     fn rebuild_scope_blocks(&mut self) {
+        // 目标/频率变更：丢弃重建后 150ms 内的预热帧（见字段注释）
+        self.scope_discard_until = Some(Instant::now() + Duration::from_millis(150));
+
         let pairs: Vec<(u64, u64)> = self
             .scope_targets
             .iter()
@@ -1456,9 +1465,16 @@ impl Engine {
         let burst_start = Instant::now();
         let burst_span = interval * count as u32;
         let t0 = self.epoch.elapsed().as_secs_f64();
+        // 预热窗内的帧照常执行（维持总线节拍与 Core 预热），但输出丢弃
+        let discard_until = self.scope_discard_until;
         match self.with_backend(|bk| bk.scope_burst(&blocks, count, interval)) {
             Some(frames) => {
                 for (offset, frame) in frames {
+                    if let Some(until) = discard_until {
+                        if burst_start + offset < until {
+                            continue;
+                        }
+                    }
                     let t = t0 + offset.as_secs_f64();
                     // 帧 = 与 blocks 同序的各块数据 → 配回块地址供 extract 使用
                     let mut block_data: Vec<(u64, Vec<u8>)> = Vec::with_capacity(frame.len());

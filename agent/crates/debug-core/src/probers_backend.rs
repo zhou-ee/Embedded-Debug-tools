@@ -343,9 +343,21 @@ impl DebugBackend for ProbeRsBackend {
                         )))
                     }
                 };
+                // 32-bit 字读在总线层面原子（无撕裂）；失败多为瞬态（USB 忙/超时），
+                // 重试一次。**不回退 read_8**：逐字节访问非原子，固件在字节间写入
+                // 会产生撕裂值（真机实测 sin_20hz 坑洼：符号位翻转的假值）。
+                // 重试仍失败 → 本块降级为空（该块目标本帧缺值，其它块不受影响）。
                 if *addr % 4 == 0 && len % 4 == 0 && len > 0 {
                     let mut words = vec![0u32; len / 4];
-                    if core.read_32(*addr, &mut words).is_ok() {
+                    let mut ok = core.read_32(*addr, &mut words).is_ok();
+                    if !ok {
+                        // 冲刺读消耗 DAP 可能残留的队列结果：失败后直接重试，
+                        // DAP 会把上一次排队未取走的数据字重复返回
+                        let mut dummy = vec![0u32; len / 4];
+                        let _ = core.read_32(*addr, &mut dummy);
+                        ok = core.read_32(*addr, &mut words).is_ok();
+                    }
+                    if ok {
                         let mut buf = Vec::with_capacity(len);
                         for w in words {
                             buf.extend_from_slice(&w.to_le_bytes());
@@ -353,7 +365,10 @@ impl DebugBackend for ProbeRsBackend {
                         frame.push(buf);
                         continue;
                     }
+                    frame.push(Vec::new());
+                    continue;
                 }
+                // 非 4 对齐块（理论不出现，merge_blocks 按 4 对齐合并）：保留 8-bit
                 let mut buf = vec![0u8; len];
                 if len > 0 {
                     core.read_8(*addr, &mut buf).map_err(Self::map_err)?;

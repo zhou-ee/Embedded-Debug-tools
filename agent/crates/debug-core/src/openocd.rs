@@ -525,29 +525,47 @@ impl DebugBackend for OpenOcdBackend {
                 let len = *len;
                 if addr % 4 == 0 && len % 4 == 0 && len > 0 {
                     let words = len / 4;
-                    if let Ok(resp) = self.tcl(&format!("read_memory 0x{addr:x} 32 {words}")) {
-                        let lower = resp.to_lowercase();
-                        if !lower.contains("error") && !lower.contains("failed") && !lower.contains("invalid command") {
-                            let u32s = parse_u32_tokens(&resp);
-                            if u32s.len() == words {
+                    // 32-bit 字读在总线层面原子（无撕裂）；带内失败多为瞬态
+                    // （目标忙/GDB 抢占/复位过渡），重试一次。
+                    // **不回退 read_memory 8**：逐字节访问非原子，固件在字节间写入
+                    // 会产生撕裂值（真机实测 sin_20hz 坑洼：符号位翻转的假值）。
+                    let mut ok = false;
+                    let mut resp = String::new();
+                    for _ in 0..2 {
+                        if let Ok(r) = self.tcl(&format!("read_memory 0x{addr:x} 32 {words}")) {
+                            let lower = r.to_lowercase();
+                            let bad = lower.contains("error") || lower.contains("failed")
+                                || lower.contains("invalid command");
+                            let u32s = parse_u32_tokens(&r);
+                            if !bad && u32s.len() == words {
                                 let mut bytes = Vec::with_capacity(len);
                                 for w in u32s {
                                     bytes.extend_from_slice(&w.to_le_bytes());
                                 }
                                 frame.push(bytes);
                                 ok_blocks += 1;
-                                continue;
+                                ok = true;
+                                break;
                             }
+                            resp = r;
+                        } else {
+                            // 传输级错误（连接破坏/帧失步）：中止整个突发走重建
+                            return Err(BackendError::Transfer(
+                                "Tcl 传输失败（连接将重建）".into(),
+                            ));
                         }
                     }
+                    if !ok {
+                        // 两次 32-bit 均失败：本块降级为空（该块目标本帧缺值，
+                        // 其它块与后续帧不受影响），避免 50ms 全通道空档台阶
+                        degraded += 1;
+                        let _ = resp;
+                        frame.push(Vec::new());
+                    }
+                    continue;
                 }
-                // 传输级错误（连接破坏/帧失步）：中止整个突发走重建
+                // 非 4 对齐块（理论不出现，示波块按 4 对齐合并）：保留 8-bit 读取
                 let resp = self.tcl(&format!("read_memory 0x{addr:x} 8 {len}"))?;
-                // 8-bit 回退路径同样必须查带内错误（与 read_bytes 主路径策略一致）。
-                // 带内错误（目标忙/GDB 抢占/复位过渡等瞬时失败）只降级**本块**为空
-                // 数据并继续突发——中止会让全部通道出现 50ms 避让级空档台阶
-                // （真机实测：halt/resume 扰动下 200Hz 掉到 181Hz，每秒多次全通道台阶）。
-                // 空块经 extract_from_blocks 后该块目标本帧缺值，其余块不受影响。
                 if check_inband_error(&resp).is_err() {
                     degraded += 1;
                     frame.push(Vec::new());
