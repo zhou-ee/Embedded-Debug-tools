@@ -202,12 +202,19 @@ class AgentService(private val project: Project) : Disposable {
      */
     private fun promoteEvalHybrid(item: WatchItem, pres: ClionEvalBridge.Presentation) {
         val result = EvalHybridPromoter.promote(pres.valueText, pres.typeText, elfVariables) ?: return
+        // 求值结果未变（地址/布局一致）：只更新引用对象，不触发结构重建——
+        // 重建会使已展开的树折叠（用户要求：结果不变保持展开状态）
+        val changed = item.address != result.address ||
+            item.size != result.size ||
+            item.evalHasChildren != result.hasChildren ||
+            item.node == null
         item.node = result.node
         item.address = result.address
         item.size = result.size
         item.encoding = result.encoding
         item.typeName = result.typeName
         item.evalHasChildren = result.hasChildren
+        if (!changed) return
         watchStructureRevision++
         logLine(
             "求值型监视「${item.expr}」已升级为固定地址实时监视 @0x${"%08X".format(result.address)}" +

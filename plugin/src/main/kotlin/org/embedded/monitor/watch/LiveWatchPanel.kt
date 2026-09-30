@@ -528,7 +528,13 @@ class LiveWatchPanel(private val project: Project) :
                         child.data.entry.evalXValue != null
                     ) {
                         child.evalXValue = child.data.entry.evalXValue
+                        child.evalHasChildren = child.data.entry.evalHasChildren
+                        // 首次求值后节点从叶子变非叶子：结构通知会折叠该节点，
+                        // 若此前已展开（重建恢复）则补一次展开
+                        val path = TreePath(arrayOf(rootNode, child))
+                        val wasExpanded = tree.isExpanded(path)
                         treeModel.nodeStructureChanged(child)
+                        if (wasExpanded) tree.expandPath(path)
                     }
                 }
                 tree.repaint()
@@ -968,7 +974,14 @@ class LiveWatchPanel(private val project: Project) :
                     autoRefresh = item.autoRefresh,
                     entry = item,
                 )
-            )
+            ).apply {
+                // 求值型条目：把求值状态带进新节点——否则 watchDataListener 的
+                // 镜像补齐会对重建后的节点再次 nodeStructureChanged，折叠刚恢复的展开
+                if (item.evalOnly) {
+                    evalXValue = item.evalXValue
+                    evalHasChildren = item.evalHasChildren
+                }
+            }
             addMembersRecursively(topNode, rootSymbol, item.expr, item.id, item.autoRefresh, item)
             rootNode.add(topNode)
         }
