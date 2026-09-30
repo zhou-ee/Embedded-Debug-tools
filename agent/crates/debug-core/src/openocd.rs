@@ -21,6 +21,8 @@ pub struct OpenOcdBackend {
     tcl_port: u16,
     child: Option<Child>,
     stream: Option<BufReader<TcpStream>>,
+    /// 示波块降级日志限流（1s 一条）
+    last_degrade_log: Option<Instant>,
     /// Windows 专属：kill-on-close Job Object，agent 崩溃时内核自动收割 openocd
     #[cfg(windows)]
     job: Option<crate::openocd_job::Job>,
@@ -42,6 +44,7 @@ impl OpenOcdBackend {
             tcl_port: TCL_PORT,
             child: None,
             stream: None,
+            last_degrade_log: None,
             #[cfg(windows)]
             job: None,
         }
@@ -511,9 +514,13 @@ impl DebugBackend for OpenOcdBackend {
     ) -> Result<BurstFrames, BackendError> {
         let start = Instant::now();
         let mut out = Vec::with_capacity(count);
+        let mut ok_blocks = 0usize;
+        let mut total_blocks = 0usize;
+        let mut degraded = 0usize;
         for i in 0..count {
             let mut frame = Vec::with_capacity(blocks.len());
             for (addr, len) in blocks {
+                total_blocks += 1;
                 let addr = *addr;
                 let len = *len;
                 if addr % 4 == 0 && len % 4 == 0 && len > 0 {
@@ -528,23 +535,52 @@ impl DebugBackend for OpenOcdBackend {
                                     bytes.extend_from_slice(&w.to_le_bytes());
                                 }
                                 frame.push(bytes);
+                                ok_blocks += 1;
                                 continue;
                             }
                         }
                     }
                 }
+                // 传输级错误（连接破坏/帧失步）：中止整个突发走重建
                 let resp = self.tcl(&format!("read_memory 0x{addr:x} 8 {len}"))?;
-                // 8-bit 回退路径同样必须查带内错误：错误文本直接喂给
-                // parse_number_tokens 得到空 Vec，样本被静默丢弃、避让/限流
-                // 机制完全绕过（与 read_bytes 主路径策略一致）
-                check_inband_error(&resp)?;
-                frame.push(parse_number_tokens(&resp));
+                // 8-bit 回退路径同样必须查带内错误（与 read_bytes 主路径策略一致）。
+                // 带内错误（目标忙/GDB 抢占/复位过渡等瞬时失败）只降级**本块**为空
+                // 数据并继续突发——中止会让全部通道出现 50ms 避让级空档台阶
+                // （真机实测：halt/resume 扰动下 200Hz 掉到 181Hz，每秒多次全通道台阶）。
+                // 空块经 extract_from_blocks 后该块目标本帧缺值，其余块不受影响。
+                if check_inband_error(&resp).is_err() {
+                    degraded += 1;
+                    frame.push(Vec::new());
+                    continue;
+                }
+                let bytes = parse_number_tokens(&resp);
+                if bytes.len() != len {
+                    degraded += 1;
+                    frame.push(Vec::new());
+                    continue;
+                }
+                frame.push(bytes);
+                ok_blocks += 1;
             }
             out.push((start.elapsed(), frame));
             let due = start + interval * (i as u32 + 1);
             let now = Instant::now();
             if now < due {
                 std::thread::sleep(due - now);
+            }
+        }
+        // 整个突发一个块都没读到：持久性故障（目标长期忙/地址无效），
+        // 返回错误交由引擎 50ms 避让，避免无输出空转
+        if ok_blocks == 0 && total_blocks > 0 {
+            return Err(BackendError::Transfer(format!(
+                "示波突发 {total_blocks} 个块全部读取失败（目标忙或地址无效）"
+            )));
+        }
+        if degraded > 0 {
+            let now = Instant::now();
+            if self.last_degrade_log.is_none_or(|t| now.duration_since(t) >= Duration::from_secs(1)) {
+                self.last_degrade_log = Some(now);
+                eprintln!("[openocd] scope 突发降级：{degraded}/{total_blocks} 块读取失败（该块目标本帧缺值，其它块不受影响）");
             }
         }
         Ok(out)
