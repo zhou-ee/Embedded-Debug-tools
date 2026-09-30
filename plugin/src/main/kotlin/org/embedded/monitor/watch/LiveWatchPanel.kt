@@ -135,8 +135,15 @@ class LiveWatchTreeNode(val data: WatchNodeData) : DefaultMutableTreeNode(data) 
      * 可能含子项时必须报告"非叶子"，否则 childCount==0 会被判为叶子、展开手柄
      * 根本不出现（真机实测 2026-09-29：类型能显示但无法展开的根因）。
      */
+    private val isPlatformEvalChild: Boolean
+        get() = evalXValue != null || evalValueText != null || evalTypeText != null
+
     override fun isLeaf(): Boolean = when {
-        data.entry.evalOnly -> data.entry.evalValue == null || !evalHasChildren
+        // 求值型顶层：有求值结果且可能含子项 → 可展开
+        data.entry.evalOnly && data.isTop -> data.entry.evalValue == null || !evalHasChildren
+        // 平台求值子节点（computeChildren 懒展开产物，无内存地址，携带平台 XValue）
+        data.entry.evalOnly && isPlatformEvalChild -> !evalHasChildren
+        // 混合升级的 ELF 成员节点（真实地址，走标准字节渲染）：标准语义
         else -> data.node.members.isEmpty()
     }
 }
@@ -364,7 +371,10 @@ class LiveWatchTreeCellRenderer @JvmOverloads constructor(
         colored.clear()
         // CLion 求值型监视子树：无内存地址，展示 IDE 调试器求值结果。
         // 顶层显示表达式与求值文本；懒展开的子节点显示成员名与各自呈现文本
-        if (data.entry.evalOnly) {
+        // 平台求值子节点 = 懒展开产物（携带平台 XValue）；混合升级的 ELF 成员
+        // 节点有真实地址与字节，必须走标准渲染（按内存偏移显示实时值）
+        val isPlatformEvalChild = data.entry.evalOnly && !data.isTop && treeNode.evalXValue != null
+        if ((data.isTop || isPlatformEvalChild) && data.entry.evalOnly) {
             colored.icon = AllIcons.Debugger.EvaluateExpression
             colored.append(treeNode.name, if (data.isTop) SimpleTextAttributes.REGULAR_ATTRIBUTES else SimpleTextAttributes.REGULAR_ATTRIBUTES)
             if (data.isTop) {
@@ -660,7 +670,14 @@ class LiveWatchPanel(private val project: Project) :
                 val node = e.path.lastPathComponent as? LiveWatchTreeNode ?: return
                 if (!node.data.entry.evalOnly) return
                 if (node.childCount > 0) return
-                val xv = node.evalXValue ?: node.data.entry.evalXValue ?: return
+                // 顶层可回退到条目的 XValue；子节点必须有自身的 XValue——
+                // 否则展开标量成员会把整个结构体的子项再挂一遍（真机实测：
+                // seq 下又出现 _ctx/seq，表现为"解析成了 pyro::wl_chassis_t *"）
+                val xv = if (node.data.isTop) {
+                    node.evalXValue ?: node.data.entry.evalXValue
+                } else {
+                    node.evalXValue
+                } ?: return
                 ApplicationManager.getApplication().executeOnPooledThread {
                     val kids = service.computeEvalChildren(xv) ?: return@executeOnPooledThread
                     val built = kids.mapNotNull { (name, childX) ->

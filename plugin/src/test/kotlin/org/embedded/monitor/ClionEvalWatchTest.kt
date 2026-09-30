@@ -1,5 +1,6 @@
 package org.embedded.monitor
 
+import org.embedded.monitor.agent.SymbolNode
 import org.embedded.monitor.settings.PersistedWatchItem
 import org.embedded.monitor.watch.LiveWatchTreeNode
 import org.embedded.monitor.watch.WatchItem
@@ -70,6 +71,55 @@ class ClionEvalWatchTest {
         assertEquals(item.expr, node.name)
         assertTrue(node.data.isTop)
         assertTrue(node.data.entry.evalOnly)
+    }
+
+    private fun treeNodeFor(
+        item: WatchItem,
+        node: SymbolNode,
+        isTop: Boolean,
+        evalXValue: Any? = null,
+        evalHasChildren: Boolean = true,
+    ) = LiveWatchTreeNode(
+        WatchNodeData(
+            entryId = item.id,
+            expr = item.expr,
+            node = node,
+            fullPath = item.expr,
+            isTop = isTop,
+            autoRefresh = false,
+            entry = item,
+        )
+    ).apply {
+        this.evalXValue = evalXValue
+        this.evalHasChildren = evalHasChildren
+    }
+
+    @Test
+    fun testEvalNodeLeafSemantics() {
+        val item = evalItem()
+        // 未求值：叶子（无手柄）
+        val pending = treeNodeFor(item, SymbolNode(name = item.expr), isTop = true)
+        assertTrue("未求值的顶层应为叶子", pending.isLeaf)
+        item.evalValue = "0x200003e4"
+        item.evalXValue = Any()
+        // 已求值且有子项：非叶子（手柄出现，V1.2.21）
+        assertFalse("已求值的顶层应可展开", pending.isLeaf)
+        // 混合升级的 ELF 成员节点：走标准语义（结构体可展开、标量是叶子）
+        val structMember = SymbolNode(
+            name = "_ctx", typeName = "wl_chassis_ctx_t", address = 0x20000420,
+            size = 104, encoding = "composite",
+            members = listOf(SymbolNode(name = "seq", typeName = "uint32_t", address = 0x20000484, size = 4, encoding = "unsigned")),
+        )
+        val hybridStruct = treeNodeFor(item, structMember, isTop = false)
+        assertFalse("混合结构体成员应可展开", hybridStruct.isLeaf)
+        val hybridScalar = treeNodeFor(item, structMember.members.single(), isTop = false)
+        assertTrue("混合标量成员应为叶子（V1.2.23 修复：seq 不再显示展开手柄）", hybridScalar.isLeaf)
+        // 平台求值子节点（懒展开产物）：按自身 XValue/hasChildren 判定
+        val platformChild = treeNodeFor(
+            item, SymbolNode(name = "child"), isTop = false,
+            evalXValue = Any(), evalHasChildren = false,
+        )
+        assertTrue("无子项的平台子节点应为叶子", platformChild.isLeaf)
     }
 
     @Test
