@@ -322,6 +322,11 @@ impl DebugBackend for OpenOcdBackend {
         self.stream.is_some()
     }
 
+    fn is_shared(&self) -> bool {
+        // attach_only=false 也可能复用了已运行的 OpenOCD，按实际进程归属判断。
+        self.child.is_none()
+    }
+
     /// 注意：**本实现不做 probe-rs 那样的 `memory_regions()` 越界预检** ——
     /// OpenOCD 侧拿不到 target 的内存映射，且读越界只会回一条带内错误文本
     /// （不会像 probe-rs 那样把访问端口留在 FAULT 态），故由目标自行报错即可。
@@ -514,10 +519,19 @@ impl DebugBackend for OpenOcdBackend {
     ) -> Result<BurstFrames, BackendError> {
         let start = Instant::now();
         let mut out = Vec::with_capacity(count);
-        let mut ok_blocks = 0usize;
         let mut total_blocks = 0usize;
         let mut degraded = 0usize;
-        for i in 0..count {
+        // 帧节拍：读耗时超过间隔时，截止时刻重锚到"当前 + 间隔"，不追赶旧截止
+        // （与 probe-rs 后端一致——旧实现超期后连续快速读取，批内间隔忽快忽慢）
+        let mut due = start;
+        for _i in 0..count {
+            if Instant::now() < due {
+                std::thread::sleep(due - Instant::now());
+            }
+            // 帧时间戳 = 本帧读取开始时刻（样本窗口起点）。旧实现取全部块读完
+            // 后的时刻，回包等待与调度延迟被混进时间戳（真机实测：Agent 时间戳
+            // 间隔与 MCU tick 间隔严重错位 56ms/6ms）
+            let frame_ts = start.elapsed();
             let mut frame = Vec::with_capacity(blocks.len());
             for (addr, len) in blocks {
                 total_blocks += 1;
@@ -543,14 +557,13 @@ impl DebugBackend for OpenOcdBackend {
                                     bytes.extend_from_slice(&w.to_le_bytes());
                                 }
                                 frame.push(bytes);
-                                ok_blocks += 1;
                                 ok = true;
                                 break;
                             }
                             resp = r;
                         } else {
                             // 传输级错误（连接破坏/帧失步）：中止整个突发走重建
-                            return Err(BackendError::Transfer(
+                            return Err(BackendError::ConnectionLost(
                                 "Tcl 传输失败（连接将重建）".into(),
                             ));
                         }
@@ -578,22 +591,12 @@ impl DebugBackend for OpenOcdBackend {
                     continue;
                 }
                 frame.push(bytes);
-                ok_blocks += 1;
             }
-            out.push((start.elapsed(), frame));
-            let due = start + interval * (i as u32 + 1);
+            out.push((frame_ts, frame));
             let now = Instant::now();
-            if now < due {
-                std::thread::sleep(due - now);
-            }
+            due = if now > due { now + interval } else { due + interval };
         }
-        // 整个突发一个块都没读到：持久性故障（目标长期忙/地址无效），
-        // 返回错误交由引擎 50ms 避让，避免无输出空转
-        if ok_blocks == 0 && total_blocks > 0 {
-            return Err(BackendError::Transfer(format!(
-                "示波突发 {total_blocks} 个块全部读取失败（目标忙或地址无效）"
-            )));
-        }
+        // 全部块失败也返回实际采样时刻的空帧；引擎计入缺样后再做 50ms 避让。
         if degraded > 0 {
             let now = Instant::now();
             if self.last_degrade_log.is_none_or(|t| now.duration_since(t) >= Duration::from_secs(1)) {
@@ -630,6 +633,51 @@ impl Drop for OpenOcdBackend {
 #[cfg(test)]
 mod tests {
     use super::{parse_number_tokens, parse_u32_tokens};
+    use crate::DebugBackend;
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::time::Duration;
+
+    fn failing_tcl_backend(close_on_read: bool) -> (super::OpenOcdBackend, std::thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let worker = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            loop {
+                let mut request = Vec::new();
+                if reader.read_until(super::FRAME, &mut request).unwrap_or(0) == 0 { break; }
+                if close_on_read { break; }
+                stream.write_all(b"error deliberate read failure\x1a").unwrap();
+            }
+        });
+        let mut backend = super::OpenOcdBackend::new("unused".into(), "".into(), None, 4_000_000);
+        let stream = TcpStream::connect(address).unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        backend.stream = Some(BufReader::new(stream));
+        (backend, worker)
+    }
+
+    #[test]
+    fn totally_failed_scope_burst_returns_timestamped_missing_frames() {
+        let (mut backend, worker) = failing_tcl_backend(false);
+        assert!(backend.is_shared(), "externally supplied connection is shared even without attach_only");
+        let frames = backend.scope_burst(&[(0x20000000, 4)], 2, Duration::from_millis(1)).unwrap();
+        assert_eq!(frames.len(), 2);
+        assert!(frames[1].0 >= frames[0].0);
+        assert!(frames.iter().all(|(_, blocks)| blocks.len() == 1 && blocks[0].is_empty()));
+        backend.stream = None;
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn scope_transport_failure_is_fatal_so_engine_reconnects() {
+        let (mut backend, worker) = failing_tcl_backend(true);
+        let error = backend.scope_burst(&[(0x20000000, 4)], 2, Duration::from_millis(1)).unwrap_err();
+        assert!(error.is_fatal());
+        assert!(!backend.is_connected());
+        worker.join().unwrap();
+    }
 
     #[test]
     fn parse_hex_tokens() {

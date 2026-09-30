@@ -532,27 +532,8 @@ class ScopeWaveformPanel : JPanel() {
         return lo
     }
 
-    /** 查找最接近目标时间戳的样本索引。 */
-    private fun nearestIndex(series: List<ScopeSample>, targetNanos: Long): Int {
-        if (series.isEmpty()) return -1
-        val idx = lowerBound(series, targetNanos)
-        if (idx >= series.size) return series.size - 1
-        if (idx > 0) {
-            val d0 = abs(series[idx].timestampNanos - targetNanos)
-            val d1 = abs(series[idx - 1].timestampNanos - targetNanos)
-            if (d1 < d0) return idx - 1
-        }
-        return idx
-    }
-
-    private fun sampleValueAt(series: List<ScopeSample>, tSec: Double): Float? {
-        if (series.isEmpty()) return null
-        val targetNanos = (tSec * 1e9).toLong()
-        val idx = nearestIndex(series, targetNanos)
-        if (idx !in series.indices) return null
-        val v = series[idx].value
-        return if (v.isNaN()) null else v
-    }
+    private fun sampleValueAt(series: List<ScopeSample>, tSec: Double): Float? =
+        ScopeSamples.valueAt(series, (tSec * 1e9).toLong())
 
     /**
      * 计算规范 1-2-5 分度步进的 Y 轴 [min, max] 视窗范围（共 H_DIVS = 8 格）：
@@ -840,7 +821,7 @@ class ScopeWaveformPanel : JPanel() {
 
             // --- 曲线（带裁切）---
             g2.clipRect(marginLeft, marginTop, plotW, plotH)
-            val visibleVars = variables.filter { it.visible }
+            val visibleVars = variables.filter { it.visible && it.resolved }
             for (variable in visibleVars) {
                 val series = data[variable.address] ?: continue
                 if (series.size < 2) continue
@@ -896,97 +877,36 @@ class ScopeWaveformPanel : JPanel() {
         if (!dark) baseColor = baseColor.darker()
 
         val path = Path2D.Float()
-        var first = true
-
-        if (step <= 1) {
-            var lastTs = -1L
-            for (i in actualStart until actualEnd) {
-                val s = series[i]
-                if (s.value.isNaN()) {
-                    first = true
-                } else if (s.timestampNanos < lastTs) {
-                    // 时间戳回退保护：防止乱序数据产生逆向反折线
-                    continue
+        // 先按缺样、实际时间空档分段，再在段内保留入口、极值、出口。
+        // 缺口即使落在同一个降采样桶内，也不能被直线跨过去。
+        ScopeSamples.forEachRun(series, actualStart, actualEnd) { runStart, runEnd ->
+            var first = true
+            fun emit(index: Int) {
+                val sample = series[index]
+                val x = xOf(sample.timestampNanos / 1e9)
+                val y = yOf(sample.value.toDouble()).coerceIn(-5000.0, plotH + 5000.0)
+                if (first) {
+                    path.moveTo(x, y)
+                    first = false
                 } else {
-                    lastTs = s.timestampNanos
-                    val x = xOf(s.timestampNanos / 1e9)
-                    val y = yOf(s.value.toDouble()).coerceIn(-5000.0, plotH + 5000.0)
-                    if (first) {
-                        path.moveTo(x, y)
-                        first = false
-                    } else {
-                        path.lineTo(x, y)
-                    }
+                    path.lineTo(x, y)
                 }
             }
-        } else {
-            // 包络降采样（Min/Max 峰值极值保留 + 严格时序顺逆序连接）：
-            // 对每个分桶提取桶内有效样本的入口点、极小值点、极大值点、出口点，
-            // 严格按照采样点在时间轴上的先后顺序（顺逆序）依次连线，
-            // 彻底解决旧版固定连接 min -> max 导致正弦波下降沿产生假尖峰/毛刺的问题，
-            // 保证鼠标悬停测得值与波形轨迹完全一致，波形平滑连续且极值不丢失。
-            var i = actualStart
-            var lastEmittedTs = -1L
-            var lastEmittedY = Double.NaN
-
-            while (i < actualEnd) {
-                val blockEnd = min(actualEnd, i + step)
-                var firstIdx = -1
-                var lastIdx = -1
-                var minIdx = -1
-                var maxIdx = -1
-                var hasGap = false
-
-                for (j in i until blockEnd) {
-                    val s = series[j]
-                    if (s.value.isNaN()) {
-                        hasGap = true
-                        continue
+            if (step <= 1) {
+                for (i in runStart until runEnd) emit(i)
+            } else {
+                var i = runStart
+                while (i < runEnd) {
+                    val blockEnd = min(runEnd, i + step)
+                    var minIdx = i
+                    var maxIdx = i
+                    for (j in i + 1 until blockEnd) {
+                        if (series[j].value < series[minIdx].value) minIdx = j
+                        if (series[j].value > series[maxIdx].value) maxIdx = j
                     }
-                    if (s.timestampNanos < lastEmittedTs) continue // 时间戳乱序保护
-                    if (firstIdx == -1) firstIdx = j
-                    lastIdx = j
-                    if (minIdx == -1 || s.value < series[minIdx].value) {
-                        minIdx = j
-                    }
-                    if (maxIdx == -1 || s.value > series[maxIdx].value) {
-                        maxIdx = j
-                    }
+                    listOf(i, minIdx, maxIdx, blockEnd - 1).distinct().sorted().forEach(::emit)
+                    i = blockEnd
                 }
-
-                if (firstIdx == -1) {
-                    first = true
-                } else {
-                    // M4 降采样算法：在每个像素/分桶内，按时间索引顺序保留入口点、极值点与出口点。
-                    // 索引天然代表采样点到达与发生的时间先后，彻底解决固定 min->max 连接或
-                    // 逆序折线在下降沿产生的假尖峰毛刺，保证极值完整呈现且折线沿时间正向严格单调。
-                    val orderedPoints = listOf(firstIdx, minIdx, maxIdx, lastIdx)
-                        .distinct()
-                        .sorted()
-                        .map { series[it] }
-
-                    for (pt in orderedPoints) {
-                        if (pt.timestampNanos < lastEmittedTs) continue
-                        val x = xOf(pt.timestampNanos / 1e9)
-                        val y = yOf(pt.value.toDouble()).coerceIn(-5000.0, plotH + 5000.0)
-
-                        // 避免在同一点重复连线
-                        if (pt.timestampNanos == lastEmittedTs && y == lastEmittedY) continue
-
-                        if (first) {
-                            path.moveTo(x, y)
-                            first = false
-                        } else {
-                            path.lineTo(x, y)
-                        }
-                        lastEmittedTs = pt.timestampNanos
-                        lastEmittedY = y
-                    }
-                    if (hasGap) {
-                        first = true
-                    }
-                }
-                i = blockEnd
             }
         }
 

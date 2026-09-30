@@ -863,27 +863,10 @@ class ScopePanel(private val project: Project) : JBPanel<ScopePanel>(BorderLayou
     ) {
         ApplicationManager.getApplication().executeOnPooledThread {
             try {
-                val rows = snapshot.values.maxOfOrNull { it.size } ?: 0
                 val span = service.scopeBufferSpanSec()
                 val rate = service.scopeBufferRateHz()
-                val cleanSnapshot = snapshot.mapValues { (addr, series) ->
-                    val v = vars.firstOrNull { it.address == addr }
-                    if (v != null) org.embedded.monitor.core.TornSampleFilter.repairSeries(series, v.format) else series
-                }
-                val baseSeries = cleanSnapshot.values.maxByOrNull { it.size } ?: emptyList()
-                java.io.File(path).printWriter().use { writer ->
-                    writer.println((listOf("time") + vars.map { it.name }).joinToString(","))
-                    for (baseSample in baseSeries) {
-                        val tSec = baseSample.timestampNanos / 1e9
-                        val row = mutableListOf<String>()
-                        row.add(String.format(Locale.ROOT, "%.6f", tSec))
-                        for (v in vars) {
-                            val series = cleanSnapshot[v.address]
-                            val value = if (series != null) sampleValueAt(series, tSec) else null
-                            row.add(if (value != null && !value.isNaN() && !value.isInfinite()) value.toString() else "")
-                        }
-                        writer.println(row.joinToString(","))
-                    }
+                val rows = java.io.File(path).bufferedWriter(Charsets.UTF_8).use { writer ->
+                    org.embedded.monitor.core.ScopeCsv.write(writer, vars, snapshot)
                 }
                 ApplicationManager.getApplication().invokeLater {
                     Messages.showInfoMessage(
@@ -898,28 +881,6 @@ class ScopePanel(private val project: Project) : JBPanel<ScopePanel>(BorderLayou
                 }
             }
         }
-    }
-
-    private fun sampleValueAt(series: List<ScopeSample>, tSec: Double): Float? {
-        if (series.isEmpty()) return null
-        val targetNanos = (tSec * 1e9).toLong()
-        var lo = 0
-        var hi = series.size
-        while (lo < hi) {
-            val mid = (lo + hi) ushr 1
-            if (series[mid].timestampNanos < targetNanos) lo = mid + 1 else hi = mid
-        }
-        val idx = if (lo >= series.size) {
-            series.size - 1
-        } else if (lo > 0) {
-            val d0 = kotlin.math.abs(series[lo].timestampNanos - targetNanos)
-            val d1 = kotlin.math.abs(series[lo - 1].timestampNanos - targetNanos)
-            if (d1 < d0) lo - 1 else lo
-        } else {
-            lo
-        }
-        val v = series.getOrNull(idx)?.value ?: return null
-        return if (v.isNaN()) null else v
     }
 
     // 全量快照克隆的在飞标记：30Hz 拉取 × 版本变化即全量 clone（50k×通道数），
@@ -956,10 +917,11 @@ class ScopePanel(private val project: Project) : JBPanel<ScopePanel>(BorderLayou
         val bufSpan = service.scopeBufferSpanSec()
         val bufHz = service.scopeBufferRateHz()
         val dropped = service.scopeDroppedCount()
+        val gaps = service.scopeGapCount()
 
         actualRateLabel.text = String.format(Locale.ROOT, "%.0f Hz", actualHz)
-        if (dropped > 0) {
-            droppedLabel.text = String.format(Locale.ROOT, "丢样 %d", dropped)
+        if (dropped > 0 || gaps > 0) {
+            droppedLabel.text = String.format(Locale.ROOT, "缺样 %d · 空档 %d", dropped, gaps)
             droppedLabel.foreground = JBColor.RED
         } else {
             droppedLabel.text = ""
@@ -969,12 +931,13 @@ class ScopePanel(private val project: Project) : JBPanel<ScopePanel>(BorderLayou
         statusLabel.text = when (state) {
             "running" -> String.format(
                 Locale.ROOT,
-                "采样中 | 目标 %.0f Hz | 实际 %.1f Hz%s | 样本 %d | 丢样 %d | 错误 %d",
+                "采样中 | 目标 %.0f Hz | 实际 %.1f Hz%s | 样本 %d | 缺样 %d | 空档 %d | 错误 %d",
                 (freqSpinner.value as Number).toDouble(),
                 actualHz,
                 bufText,
                 service.scopeSampleCount(),
                 dropped,
+                gaps,
                 service.scopeErrorCount(),
             ) + (service.lastEngineError?.let { " | $it" } ?: "")
             "halted" -> "目标已暂停"
@@ -1105,10 +1068,10 @@ class ScopeChannelTableModel(
             0 -> v.visible
             1 -> v.name
             2 -> v.format
-            3 -> String.format(Locale.ROOT, "0x%08X", v.address)
+            3 -> if (v.resolved) String.format(Locale.ROOT, "0x%08X", v.address) else "待定位"
             4 -> "${v.size} B"
-            5 -> lastValues[v.address]?.let { formatValue(it) } ?: "-"
-            6 -> cursorValues[v.name]?.let { formatValue(it) } ?: "-"
+            5 -> if (v.resolved) lastValues[v.address]?.let { formatValue(it) } ?: "-" else "-"
+            6 -> if (v.resolved) cursorValues[v.name]?.let { formatValue(it) } ?: "-" else "-"
             else -> ""
         }
     }

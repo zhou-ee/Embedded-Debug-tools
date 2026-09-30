@@ -147,10 +147,10 @@ fn full_debug_flow_with_sim_backend() {
     tx.send(Command::SetScopeFreq(200.0)).unwrap();
     tx.send(Command::Resume).unwrap();
     let scope = wait_for(&rx, Duration::from_secs(3), |e| {
-        matches!(e, Event::ScopeData { samples } if samples.len() >= 3)
+        matches!(e, Event::ScopeData { samples, .. } if samples.len() >= 3)
     });
     assert!(scope.is_some(), "应收到批量示波数据");
-    if let Some(Event::ScopeData { samples }) = scope {
+    if let Some(Event::ScopeData { samples, .. }) = scope {
         let key = format!("0x{:08x}", SIG + 4);
         assert!(samples[0].values.contains_key(&key));
         // 时间戳单调
@@ -237,7 +237,7 @@ fn scope_sampling_rate_1khz() {
     let deadline = Instant::now() + Duration::from_millis(1200);
     let mut stamps: Vec<f64> = Vec::new();
     while Instant::now() < deadline {
-        if let Ok(Event::ScopeData { samples }) =
+        if let Ok(Event::ScopeData { samples, .. }) =
             rx.recv_timeout(Duration::from_millis(100))
         {
             stamps.extend(samples.iter().map(|s| s.t));
@@ -351,7 +351,7 @@ fn test_watch_and_scope_simultaneous() {
                 Event::WatchData { values, .. } if values.contains_key("live_val") => {
                     watch_count += 1;
                 }
-                Event::ScopeData { samples } => {
+                Event::ScopeData { samples, .. } => {
                     scope_samples += samples.len();
                 }
                 _ => {}
@@ -412,7 +412,7 @@ fn test_watch_15hz_and_scope_simultaneous_eliminates_12hz_ceiling() {
                 Event::WatchData { values, .. } if values.contains_key("live_val") => {
                     watch_count += 1;
                 }
-                Event::ScopeData { samples } => {
+                Event::ScopeData { samples, .. } => {
                     scope_samples += samples.len();
                 }
                 _ => {}

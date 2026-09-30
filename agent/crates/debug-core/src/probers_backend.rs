@@ -53,6 +53,11 @@ const PERIPH_HI: u64 = 0x6000_0000;
 const EXT_RAM_LO: u64 = 0x6000_0000;
 const EXT_RAM_HI: u64 = 0xA000_0000;
 
+/// 示波读诊断计数（scope_perf 暴露）
+pub static CORE_ACQUIRE_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static SCOPE_READ32_RETRIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static SCOPE_BLOCKS_DEGRADED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 pub struct ProbeRsBackend {
     target: String,
     speed_hz: u32,
@@ -103,8 +108,10 @@ impl ProbeRsBackend {
         // 循环：连接 / 停住 / "An ARM specific error" / 断连，往复不断）。
         // 这里改为：按错误文本归类，只有**连续**失败到阈值才升级为连接丢失；
         // 单次失败降级为瞬时错误，交给引擎的轮询周期自然重试。
+        let t0 = std::time::Instant::now();
         match session.core(0) {
             Ok(core) => {
+                CORE_ACQUIRE_US.fetch_add(t0.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
                 self.core_fail_streak = 0;
                 Ok(core)
             }
@@ -289,7 +296,17 @@ impl DebugBackend for ProbeRsBackend {
         let start = Instant::now();
         let mut core = self.core()?;
         let mut out = Vec::with_capacity(count);
-        for i in 0..count {
+        // 帧节拍：读耗时超过间隔时，截止时刻重锚到"当前 + 间隔"，不追赶旧截止——
+        // 旧实现超期后沿用旧截止连续快速读取，批内间隔忽快忽慢
+        let mut due = start;
+        for _i in 0..count {
+            if Instant::now() < due {
+                std::thread::sleep(due - Instant::now());
+            }
+            // 帧时间戳 = 本帧读取开始时刻（样本窗口起点）。旧实现取全部块读完
+            // 后的时刻，回包等待与调度延迟被混进时间戳（真机实测：Agent 时间戳
+            // 间隔与 MCU tick 间隔严重错位 56ms/6ms）
+            let frame_ts = start.elapsed();
             let mut frame = Vec::with_capacity(blocks.len());
             for (addr, len) in blocks {
                 // 同 read_bytes：地址不在任何区域内就**不要下发**，
@@ -351,6 +368,7 @@ impl DebugBackend for ProbeRsBackend {
                     let mut words = vec![0u32; len / 4];
                     let mut ok = core.read_32(*addr, &mut words).is_ok();
                     if !ok {
+                        SCOPE_READ32_RETRIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         // 冲刺读消耗 DAP 可能残留的队列结果：失败后直接重试，
                         // DAP 会把上一次排队未取走的数据字重复返回
                         let mut dummy = vec![0u32; len / 4];
@@ -365,6 +383,7 @@ impl DebugBackend for ProbeRsBackend {
                         frame.push(buf);
                         continue;
                     }
+                    SCOPE_BLOCKS_DEGRADED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     frame.push(Vec::new());
                     continue;
                 }
@@ -375,12 +394,11 @@ impl DebugBackend for ProbeRsBackend {
                 }
                 frame.push(buf);
             }
-            out.push((start.elapsed(), frame));
-            let due = start + interval * (i as u32 + 1);
+            out.push((frame_ts, frame));
+            // 节拍推进：读取在截止前完成 → 沿用原节拍（间隔严格均匀）；
+            // 超期（读耗时超过间隔）→ 重锚到"当前 + 间隔"，不追赶旧截止
             let now = Instant::now();
-            if now < due {
-                std::thread::sleep(due - now);
-            }
+            due = if now > due { now + interval } else { due + interval };
         }
         Ok(out)
     }

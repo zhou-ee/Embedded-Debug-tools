@@ -47,7 +47,7 @@ sealed class EngineEvent {
     data class Disconnected(val reason: String) : EngineEvent()
     data class State(val state: String) : EngineEvent() // running / halted / disconnected
     data class WatchData(val values: Map<String, ByteArray>, val halted: Boolean) : EngineEvent()
-    data class ScopeData(val samples: List<ScopeRawSample>) : EngineEvent()
+    data class ScopeData(val samples: List<ScopeRawSample>, val intervalUs: Long? = null) : EngineEvent()
     data class Error(val message: String) : EngineEvent()
     data class Log(val message: String) : EngineEvent()
     data class Unknown(val kind: String) : EngineEvent()
@@ -77,6 +77,8 @@ object EngineEventParser {
                 EngineEvent.WatchData(values, data.get("halted")?.asBoolean ?: false)
             }
             "scopeData" -> {
+                // 本批实际配置的采样间隔（µs）；旧 agent 缺省 null → 前端按配置频率推算
+                val intervalUs = data.get("intervalUs")?.takeIf { it.isJsonPrimitive }?.asLong
                 val samples = ArrayList<ScopeRawSample>()
                 data.getAsJsonArray("samples")?.forEach { el ->
                     val o = el.asJsonObject
@@ -86,7 +88,7 @@ object EngineEventParser {
                     }
                     samples.add(ScopeRawSample(o.get("t")?.asDouble ?: 0.0, values))
                 }
-                EngineEvent.ScopeData(samples)
+                EngineEvent.ScopeData(samples, intervalUs)
             }
             else -> EngineEvent.Unknown(kind)
         }

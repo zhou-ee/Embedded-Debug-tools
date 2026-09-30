@@ -258,7 +258,7 @@ fn main() {
         .filter_map(|n| var(n).map(|v| format!("0x{:08x}", v.address)))
         .collect();
     while Instant::now() < deadline {
-        if let Ok(Event::ScopeData { samples }) =
+        if let Ok(Event::ScopeData { samples, .. }) =
             rx.recv_timeout(Duration::from_millis(100))
         {
             for s in samples {

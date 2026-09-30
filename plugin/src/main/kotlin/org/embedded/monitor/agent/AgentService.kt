@@ -9,6 +9,7 @@ import com.intellij.openapi.project.Project
 import com.intellij.openapi.util.Disposer
 import org.embedded.monitor.cmake.ElfAutoResolver
 import org.embedded.monitor.core.ScopeSample
+import org.embedded.monitor.core.ScopeSamples
 import org.embedded.monitor.core.ScopeVariable
 import org.embedded.monitor.core.ValueFormat
 import org.embedded.monitor.settings.EmbeddedMonitorSettings
@@ -313,6 +314,8 @@ class AgentService(private val project: Project) : Disposable {
     private val scopeSampleCounter = AtomicLong(0)
     private val scopeErrorCounter = AtomicLong(0)
     private val scopeDroppedCounter = AtomicLong(0)
+    private val scopeGapCounter = AtomicLong(0)
+    private val scopeResolveLock = Any()
 
     @Volatile var isScopePaused: Boolean = false
     @Volatile var continueScopeHistory: Boolean = true
@@ -1661,6 +1664,11 @@ class AgentService(private val project: Project) : Disposable {
                 watchHalted = isDebuggerPaused || isHaltedByDebug
                 if (!isScopePaused) {
                     synchronized(bufLock) {
+                        val variables = scopeVariables.filter { it.resolved }
+                        // 空档判定周期优先用本批数据自带的采样间隔——配置切换期间的
+                        // 在途帧按其真实节拍判定，不按前端当前配置误判
+                        val periodNanos = ((ev.intervalUs ?: (1e9 / currentScopeFreqHz.coerceIn(1.0, 5000.0)).toLong())
+                            .coerceAtLeast(1)) * 1000
                         for (sample in ev.samples) {
                             val rawT = sample.t
                             val isEpochReset = isNewEngineSession || (lastRawTimeSec >= 0.0 && rawT < lastRawTimeSec)
@@ -1686,33 +1694,20 @@ class AgentService(private val project: Project) : Disposable {
                             if (tNanos <= lastEmittedTimestampNanos && lastEmittedTimestampNanos > 0L) {
                                 tNanos = lastEmittedTimestampNanos + 100_000L // 保证至少单调递增 0.1ms
                             }
+                            if (lastEmittedTimestampNanos > 0L &&
+                                ScopeSamples.isLongGap(lastEmittedTimestampNanos, tNanos, periodNanos)) {
+                                scopeGapCounter.incrementAndGet()
+                            }
                             lastEmittedTimestampNanos = tNanos
 
-                            for ((addrHex, bytes) in sample.values) {
-                                val addr = addrHex.removePrefix("0x").toLongOrNull(16) ?: continue
-                                val variable = scopeVariables.firstOrNull { it.address == addr }
-                                if (variable == null) {
+                            val values = sample.values.mapNotNull { (addrHex, bytes) ->
+                                addrHex.removePrefix("0x").toLongOrNull(16)?.let { it to bytes }
+                            }.toMap()
+                            for (variable in variables) {
+                                val deque = scopeSeries.getOrPut(variable.address) { java.util.ArrayDeque(4096) }
+                                if (ScopeSamples.append(deque, tNanos, values[variable.address], variable,
+                                        periodNanos, scopeCapacity)) {
                                     scopeDroppedCounter.incrementAndGet()
-                                    continue
-                                }
-                                val value = if (bytes.isEmpty()) {
-                                    scopeDroppedCounter.incrementAndGet()
-                                    Float.NaN
-                                } else {
-                                    variable.format.decode(bytes)
-                                }
-                                val deque = scopeSeries.getOrPut(addr) { java.util.ArrayDeque(4096) }
-                                if (deque.size >= 2) {
-                                    val prev1 = deque.removeLast()
-                                    val prev2 = deque.peekLast()
-                                    val repairedValue = if (prev2 != null) {
-                                        org.embedded.monitor.core.TornSampleFilter.repairIfTorn(prev2.value, prev1.value, value, variable.format)
-                                    } else prev1.value
-                                    deque.addLast(if (repairedValue != prev1.value) ScopeSample(prev1.timestampNanos, repairedValue) else prev1)
-                                }
-                                deque.addLast(ScopeSample(tNanos, value))
-                                while (deque.size > scopeCapacity) {
-                                    deque.removeFirst()
                                 }
                             }
                         }
@@ -1824,8 +1819,11 @@ class AgentService(private val project: Project) : Disposable {
                     for (v in variables) {
                         list.add(gson.fromJson(v, SymbolNode::class.java))
                     }
-                    elfVariables.clear()
-                    elfVariables.addAll(list)
+                    synchronized(scopeResolveLock) {
+                        elfVariables.clear()
+                        elfVariables.addAll(list)
+                        scopeVariables.filter { it.expression != null }.forEach { it.resolved = false }
+                    }
                     elfPath = file.canonicalPath
                     elfMtime = runCatching { file.lastModified() }.getOrDefault(0L)
                     elfSource = source
@@ -1835,6 +1833,8 @@ class AgentService(private val project: Project) : Disposable {
                     ApplicationManager.getApplication().executeOnPooledThread {
                         reResolveWatches()
                         restorePersisted()
+                        reResolveScopeVariables()
+                        pushScopeTargets()
                     }
                     future.complete(true)
                 } catch (e: Exception) {
@@ -2143,9 +2143,8 @@ class AgentService(private val project: Project) : Disposable {
 
     // ================= 示波通道 =================
 
-    fun addScopeVariable(name: String, address: Long, size: Int, encoding: String): ScopeVariable? {
+    fun addScopeVariable(name: String, address: Long, size: Int, encoding: String, fixedAddress: Boolean = false): ScopeVariable? {
         if (address < 0x1000L) return null
-        if (scopeVariables.any { it.address == address }) return null
         val v = ScopeVariable(
             name = name,
             address = address,
@@ -2153,23 +2152,37 @@ class AgentService(private val project: Project) : Disposable {
             format = ValueFormat.fromEncoding(encoding, size),
             colorIndex = colorSeq.getAndIncrement(),
             visible = true,
+            expression = ScopeTargetResolver.binding(name, address, fixedAddress = fixedAddress),
         )
-        scopeVariables.add(v)
+        synchronized(scopeVariables) {
+            if (scopeVariables.any { it.address == address }) return null
+            scopeVariables.add(v)
+        }
         persistScope()
         pushScopeTargets()
         return v
     }
 
     fun removeScopeVariable(address: Long) {
-        scopeVariables.removeIf { it.address == address }
-        synchronized(bufLock) { scopeSeries.remove(address) }
+        synchronized(scopeVariables) {
+            scopeVariables.removeIf { it.address == address }
+            synchronized(bufLock) {
+                scopeSeries.remove(address)
+                scopeVersion++
+            }
+        }
         persistScope()
         pushScopeTargets()
     }
 
     fun clearScopeVariables() {
-        scopeVariables.clear()
-        synchronized(bufLock) { scopeSeries.clear() }
+        synchronized(scopeVariables) {
+            scopeVariables.clear()
+            synchronized(bufLock) {
+                scopeSeries.clear()
+                scopeVersion++
+            }
+        }
         persistScope()
         pushScopeTargets()
     }
@@ -2180,13 +2193,17 @@ class AgentService(private val project: Project) : Disposable {
     }
 
     fun setScopeVariableFormat(address: Long, format: ValueFormat) {
-        val idx = scopeVariables.indexOfFirst { it.address == address }
-        if (idx >= 0) {
-            val v = scopeVariables[idx]
-            scopeVariables[idx] = v.copy(format = format)
-            persistScope()
-            pushScopeTargets()
+        synchronized(scopeVariables) {
+            val idx = scopeVariables.indexOfFirst { it.address == address }
+            if (idx < 0) return
+            scopeVariables[idx] = scopeVariables[idx].copy(format = format)
+            synchronized(bufLock) {
+                scopeSeries.remove(address)
+                scopeVersion++
+            }
         }
+        persistScope()
+        pushScopeTargets()
     }
 
     fun setScopeVariableColor(address: Long, color: java.awt.Color) {
@@ -2241,6 +2258,7 @@ class AgentService(private val project: Project) : Disposable {
         scopeSampleCounter.set(0)
         scopeErrorCounter.set(0)
         scopeDroppedCounter.set(0)
+        scopeGapCounter.set(0)
     }
 
     /** 快照：地址 → 序列（画布/CSV 用）。带版本缓存，避免高频重复克隆全量序列引发 GC 与 EDT 卡顿。 */
@@ -2279,6 +2297,7 @@ class AgentService(private val project: Project) : Disposable {
     fun scopeSampleCount(): Long = scopeSampleCounter.get()
     fun scopeErrorCount(): Long = scopeErrorCounter.get()
     fun scopeDroppedCount(): Long = scopeDroppedCounter.get()
+    fun scopeGapCount(): Long = scopeGapCounter.get()
 
     private fun scopeBufferSpanSecInternal(): Double {
         var minNanos = Long.MAX_VALUE
@@ -2481,6 +2500,7 @@ class AgentService(private val project: Project) : Disposable {
 
     private fun doPushScopeTargets() {
         val client = clientRef.get() ?: return
+        reResolveScopeVariables()
         val isDebuggerPaused = org.embedded.monitor.cmake.OpenOcdConfigReader.isAnySessionPaused(project)
         if (isDebuggerPaused && settings.pausePollingOnBreakpoint) {
             // 目标正处于断点暂停态：挂起示波器高频轮询（避免打扰 GDB 单步与上下文恢复）
@@ -2488,19 +2508,70 @@ class AgentService(private val project: Project) : Disposable {
         }
         val arr = JsonArray()
         scopeVariables.forEach { v ->
-            if (v.address >= 0x1000L) {
+            if (v.resolved && v.address >= 0x1000L) {
                 val o = JsonObject()
                 o.addProperty("addr", v.address)
                 o.addProperty("size", v.size)
                 arr.add(o)
             }
         }
-        ApplicationManager.getApplication().executeOnPooledThread {
-            runCatching {
-                client.requestSync("set_scope_targets", JsonObject().apply { add("targets", arr) }, 5000)
-            }.onFailure { log.warn("set_scope_targets 失败", it) }
-            checkScopeBandwidth(arr)
+        // pushExecutor 串行发布，防止多个 pooled 请求把旧地址覆盖回新地址。
+        runCatching {
+            client.requestSync("set_scope_targets", JsonObject().apply { add("targets", arr) }, 5000)
+        }.onFailure { log.warn("set_scope_targets 失败", it) }
+        checkScopeBandwidth(arr)
+    }
+
+    /** 每次 ELF 重载、重连或恢复采样时，以当前符号和现场指针重新定位。 */
+    private fun reResolveScopeVariables() = synchronized(scopeResolveLock) {
+        if (!elfLoaded) return@synchronized
+        val variables = elfVariables.toList()
+        val client = clientRef.get()
+        val pointerValues = HashMap<Long, Long?>()
+        var changed = false
+        for (old in scopeVariables.toList()) {
+            val expression = old.expression ?: continue
+            val node = ScopeTargetResolver.resolve(expression, variables) { address ->
+                pointerValues.getOrPut(address) {
+                    if (client == null || engineState !in listOf("running", "halted")) null else {
+                        val resp = runCatching {
+                            client.requestSync("read_mem", JsonObject().apply {
+                                addProperty("addr", address)
+                                addProperty("size", 4)
+                            }, 3000)
+                        }.getOrNull()
+                        val bytes = resp?.takeIf { it.get("ok")?.asBoolean == true }
+                            ?.get("result")?.takeIf { it.isJsonArray }?.asJsonArray
+                        if (bytes == null || bytes.size() != 4) null else {
+                            (0..3).fold(0L) { value, i -> value or ((bytes[i].asInt.toLong() and 0xFF) shl (8 * i)) }
+                        }
+                    }
+                }
+            }
+            synchronized(scopeVariables) channel@{
+                val idx = scopeVariables.indexOfFirst { it === old }
+                if (idx < 0) return@channel
+                val relocated = node != null && (old.address != node.address || old.size != node.size)
+                if (node == null || relocated) {
+                    synchronized(bufLock) {
+                        scopeSeries.remove(old.address)
+                        if (node != null) scopeSeries.remove(node.address)
+                        scopeVersion++
+                    }
+                }
+                if (node == null) {
+                    if (old.resolved) logLine("示波通道 ${old.name} 无法定位，已暂停该通道")
+                    old.resolved = false
+                } else {
+                    scopeVariables[idx] = old.copy(address = node.address, size = node.size, resolved = true)
+                    if (relocated) {
+                        changed = true
+                        logLine("示波通道 ${old.name} 已重新定位到 0x${node.address.toString(16)}")
+                    }
+                }
+            }
         }
+        if (changed) persistScope()
     }
 
     /** 带宽预警标志：目标/频率变化时重置，同类告警只提示一次 */
@@ -2518,11 +2589,19 @@ class AgentService(private val project: Project) : Disposable {
             return
         }
         val freq = currentScopeFreqHz
+        val targets = JsonArray().apply {
+            arr.forEach { target ->
+                add(JsonArray().apply {
+                    add(target.asJsonObject.get("addr"))
+                    add(target.asJsonObject.get("size"))
+                })
+            }
+        }
         runCatching {
             val resp = client.requestSync(
                 "check_bandwidth",
                 JsonObject().apply {
-                    add("targets", arr)
+                    add("targets", targets)
                     addProperty("freq", freq)
                 },
                 5000,
@@ -2533,7 +2612,7 @@ class AgentService(private val project: Project) : Disposable {
                 val bps = o.get("bytesPerSecond")?.asLong ?: -1L
                 notify(
                     "示波器：当前 ${arr.size()} 通道 × ${freq.toInt()}Hz 超出探针链路带宽" +
-                        (if (bps > 0) "（实测约 ${"%.0f".format(bps / 1000.0)}KB/s）" else "") +
+                        (if (bps > 0) "（预计占用 ${"%.0f".format(bps / 1000.0)}KB/s）" else "") +
                         "，实际采样率将低于设定值。可降低采样频率或减少通道。",
                     com.intellij.notification.NotificationType.WARNING,
                 )
@@ -2558,6 +2637,7 @@ class AgentService(private val project: Project) : Disposable {
                     it.name, it.address, it.size,
                     encodingOf(it.format), it.format.name, it.colorIndex, it.visible,
                     it.customColor?.rgb ?: -1,
+                    it.expression ?: "", it.expression == null,
                 )
             }.toMutableList()
         }
@@ -2592,7 +2672,8 @@ class AgentService(private val project: Project) : Disposable {
         }
         pushWatchTargets()
         for (c in s.scopeChannels) {
-            if (scopeVariables.none { it.address == c.address }) {
+            val expression = ScopeTargetResolver.binding(c.name, c.address, c.expression, c.fixedAddress)
+            if (scopeVariables.none { it.name == c.name && it.expression == expression }) {
                 val customColor = if (c.customColorRgb != -1) java.awt.Color(c.customColorRgb, true) else null
                 scopeVariables.add(
                     ScopeVariable(
@@ -2603,6 +2684,8 @@ class AgentService(private val project: Project) : Disposable {
                         colorIndex = c.colorIndex,
                         visible = c.visible,
                         customColor = customColor,
+                        expression = expression,
+                        resolved = expression == null,
                     ),
                 )
             }

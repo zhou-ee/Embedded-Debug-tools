@@ -26,7 +26,7 @@ pub struct MemTarget {
 }
 
 /// 示波器目标。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ScopeTarget {
     pub addr: u64,
@@ -95,6 +95,8 @@ pub enum Command {
         reply: Sender<Result<Vec<u8>, String>>,
     },
     RequestRegsAndStack,
+    /// 示波分段耗时诊断（scope_perf 协议暴露）
+    ScopePerf { reply: Sender<Result<serde_json::Value, String>> },
     Shutdown,
 }
 
@@ -118,6 +120,9 @@ pub enum Event {
     /// 示波器批量采样：[(秒时间戳, addrHex → 字节)]
     ScopeData {
         samples: Vec<ScopeSample>,
+        /// 本批实际配置的采样间隔（µs）——空档判定用数据自带节拍，
+        /// 避免旧在途帧被前端按新配置频率误判
+        interval_us: u64,
     },
     BreakpointHit {
         pc: u64,
@@ -245,6 +250,8 @@ struct Engine {
     bp_quota: Option<(usize, usize)>,
     /// DWT 数据观察点地址（最多 4 个）
     watchpoints: Vec<u64>,
+    /// 本会话成功写入的 DWT 比较器（槽位、地址）；不接管外部调试器的比较器。
+    owned_watchpoints: Vec<(usize, u64)>,
     /// 上次回报给用户的"硬件实际武装列表"，避免重复刷同一条日志
     last_watchpoints_reported: Vec<u64>,
     /// 停住瞬间取样的 DWT 匹配状态 `(DFSR, FUNCTION0..3)`。
@@ -272,6 +279,11 @@ struct Engine {
     next_scope_flush: Instant,
     /// 示波读块缓存（targets/freq 变化时重建，避免每次采样重算合并）
     scope_blocks: Vec<bandwidth::MemBlock>,
+    /// 示波分段耗时统计（µs 累计，诊断用；Instant 开销每突发仅数次）
+    perf_bursts: u64,
+    perf_frames: u64,
+    perf_frames_degraded: u64,
+    perf_burst_wall_us: u64,
     /// 重建后的预热丢弃窗：目标/频率变更后该时刻之前的帧整体丢弃。探针 Core
     /// 初始化 + 首次访问处于预热期——真机实测预热垃圾可持续超出单个突发
     /// （第二帧仍异常：不同地址返回相同值/符号位翻转假值），按时间窗丢弃
@@ -304,6 +316,7 @@ impl Engine {
             applied_bps: Vec::new(),
             bp_quota: None,
             watchpoints: Vec::new(),
+            owned_watchpoints: Vec::new(),
             last_watchpoints_reported: Vec::new(),
             pending_dwt: None,
             last_halt_at: None,
@@ -320,6 +333,10 @@ impl Engine {
             next_scope_flush: now,
             scope_blocks: Vec::new(),
             scope_discard_until: None,
+            perf_bursts: 0,
+            perf_frames: 0,
+            perf_frames_degraded: 0,
+            perf_burst_wall_us: 0,
             held_break_addr: None,
             temp_bps: Vec::new(),
             // 空文本与任何错误都不同，首条错误必然放行
@@ -435,18 +452,16 @@ impl Engine {
             }
         }
 
-        // 退出前清理（顺序重要）：
-        // 1) 清除本会话下发的全部硬件断点——FPB 比较器不随会话结束而消失，
-        //    遗留会导致目标复位后在断点处莫名停止、调试器状态灯异常；
-        // 2) halt 态则恢复运行——停止监视后设备应继续工作而非冻结；
-        // 3) 断开后端连接。
-        // 清除 DWT 观察点比较器（FUNCTION=0 停用）
-        for n in 0..MAX_WATCHPOINTS {
-            let _ = self
-                .backend
-                .as_mut()
-                .map(|b| b.write_u32(DWT_FUNCTION + 0x10 * n as u64, 0));
+        self.disconnect_backend();
+        #[cfg(windows)]
+        unsafe {
+            windows_sys::Win32::Media::timeEndPeriod(1);
         }
+    }
+
+    /// 显式断开、换连接和退出共用清理路径，只清理本会话拥有的资源。
+    fn disconnect_backend(&mut self) {
+        self.clear_owned_watchpoints();
         let leftover_bps: Vec<u64> = self
             .applied_bps
             .iter()
@@ -457,18 +472,20 @@ impl Engine {
             for addr in &leftover_bps {
                 let _ = b.clear_breakpoint(*addr);
             }
-            if b.is_halted().unwrap_or(false) {
+            if !b.is_shared() && b.is_halted().unwrap_or(false) {
                 let _ = b.resume();
             }
         }
         self.applied_bps.clear();
         self.temp_bps.clear();
+        self.owned_watchpoints.clear();
+        self.last_watchpoints_reported.clear();
+        self.pending_dwt = None;
+        self.bp_quota = None;
+        self.last_state = None;
+        self.scope_buffer.clear();
         if let Some(mut b) = self.backend.take() {
             b.disconnect();
-        }
-        #[cfg(windows)]
-        unsafe {
-            windows_sys::Win32::Media::timeEndPeriod(1);
         }
     }
 
@@ -488,16 +505,13 @@ impl Engine {
     fn handle_command(&mut self, cmd: Command) {
         match cmd {
             Command::Connect(params) => {
+                self.disconnect_backend();
                 self.params = Some(params);
-                self.backend = None;
-                self.bp_quota = None;
                 self.next_reconnect = Instant::now();
                 self.try_reconnect();
             }
             Command::Disconnect => {
-                if let Some(mut b) = self.backend.take() {
-                    b.disconnect();
-                }
+                self.disconnect_backend();
                 self.params = None;
                 self.last_state = None;
                 self.emit(Event::Disconnected {
@@ -512,19 +526,25 @@ impl Engine {
                 }
             }
             Command::UpdateScopeTargets(targets) => {
-                self.scope_targets = targets;
-                self.rebuild_scope_blocks();
-                self.next_scope = Instant::now();
+                if self.scope_targets != targets {
+                    self.scope_targets = targets;
+                    self.scope_buffer.clear();
+                    self.rebuild_scope_blocks();
+                    self.next_scope = Instant::now();
+                }
             }
             Command::SetScopeFreq(freq) => {
                 // 对齐 SetWatchFreq：非有限值回落引擎默认，防库直调注入 NaN
-                self.scope_freq = if freq.is_finite() {
+                let clamped = if freq.is_finite() {
                     freq.clamp(1.0, 5000.0)
                 } else {
                     50.0
                 };
-                self.rebuild_scope_blocks();
-                self.next_scope = Instant::now();
+                if self.scope_freq != clamped {
+                    self.scope_freq = clamped;
+                    self.rebuild_scope_blocks();
+                    self.next_scope = Instant::now();
+                }
             }
             Command::SetWatchFreq(freq) => {
                 // clamp 对 NaN 返回 NaN → Duration::from_secs_f64 panic（库直调可达，
@@ -658,6 +678,18 @@ impl Engine {
             Command::RequestRegsAndStack => {
                 self.send_regs_and_stack();
             }
+            Command::ScopePerf { reply } => {
+                let v = serde_json::json!({
+                    "bursts": self.perf_bursts,
+                    "frames": self.perf_frames,
+                    "burstWallUs": self.perf_burst_wall_us,
+                    "framesDegraded": self.perf_frames_degraded,
+                    "probeRead32Retries": debug_core::probers_backend::SCOPE_READ32_RETRIES.load(std::sync::atomic::Ordering::Relaxed),
+                    "probeBlocksDegraded": debug_core::probers_backend::SCOPE_BLOCKS_DEGRADED.load(std::sync::atomic::Ordering::Relaxed),
+                    "probeCoreAcquireUs": debug_core::probers_backend::CORE_ACQUIRE_US.load(std::sync::atomic::Ordering::Relaxed),
+                });
+                let _ = reply.send(Ok(v));
+            }
             Command::Shutdown => {
                 self.shutdown = true;
             }
@@ -697,6 +729,8 @@ impl Engine {
             Ok(()) => {
                 self.backend = Some(backend);
                 self.last_state = None;
+                self.scope_buffer.clear();
+                self.rebuild_scope_blocks();
                 self.emit(Event::Connected {
                     description: match params.kind {
                         // 带上实际生效的 SWD 时钟：用户改了速度配置后能在此核对
@@ -842,7 +876,7 @@ impl Engine {
         // DWT 匹配状态取样：**必须在 is_halted() 之前**（见 pending_dwt 字段注释）——
         // 读 DHCSR / 重新 attach 访问端口会把标志清掉。
         // 只在武装了观察点时取样，避免给普通会话增加 PPB 访问。
-        if self.watchpoints.is_empty() {
+        if self.owned_watchpoints.is_empty() {
             self.pending_dwt = None;
         } else {
             let fresh = self.sample_dwt();
@@ -949,12 +983,10 @@ impl Engine {
     /// 调用时机很关键 —— 越早越好，因为标志会被后续 PPB 访问清掉（见 `pending_dwt` 字段注释）。
     fn sample_dwt(&mut self) -> (u32, Vec<u32>) {
         let dfsr = self.with_backend(|b| b.read_u32(DFSR)).unwrap_or(0);
-        let mut fns = Vec::with_capacity(MAX_WATCHPOINTS);
-        for n in 0..MAX_WATCHPOINTS {
-            fns.push(
-                self.with_backend(|b| b.read_u32(DWT_FUNCTION + 0x10 * n as u64))
-                    .unwrap_or(0),
-            );
+        let mut fns = vec![0; MAX_WATCHPOINTS];
+        for (slot, _) in self.owned_watchpoints.clone() {
+            fns[slot] = self.with_backend(|b| b.read_u32(DWT_FUNCTION + 0x10 * slot as u64))
+                .unwrap_or(0);
         }
         (dfsr, fns)
     }
@@ -982,8 +1014,36 @@ impl Engine {
         out
     }
 
-    /// 编程 DWT 观察点比较器（经通用内存访问写调试寄存器——两后端一致）。
-    /// addr 需 4 字节对齐；观察读写访问；未占用的比较器停用。
+    fn watchpoint_is_ours(backend: &mut dyn DebugBackend, slot: usize, addr: u64) -> Result<bool, BackendError> {
+        let offset = 0x10 * slot as u64;
+        let comp = backend.read_u32(DWT_COMP + offset)?;
+        let mask = backend.read_u32(DWT_MASK + offset)?;
+        let function = backend.read_u32(DWT_FUNCTION + offset)?;
+        // MATCHED 和 LNK1ENA 为硬件状态位，不参与配置归属比较。
+        Ok(comp as u64 == addr && mask == 2 &&
+            function & !((1 << 24) | (1 << 9)) == DWT_FN_DATA_RW_4B)
+    }
+
+    fn clear_owned_watchpoints(&mut self) {
+        let owned = std::mem::take(&mut self.owned_watchpoints);
+        if let Some(backend) = self.backend.as_mut() {
+            for (slot, addr) in owned {
+                match Self::watchpoint_is_ours(backend.as_mut(), slot, addr) {
+                    Ok(true) => {
+                        if backend.write_u32(DWT_FUNCTION + 0x10 * slot as u64, 0).is_err() {
+                            self.owned_watchpoints.push((slot, addr));
+                        }
+                    }
+                    Ok(false) => {} // 外部调试器已更改该槽位，归属已经转移。
+                    Err(_) => self.owned_watchpoints.push((slot, addr)),
+                }
+            }
+        } else {
+            self.owned_watchpoints = owned;
+        }
+    }
+
+    /// 使用空闲 DWT 比较器；重配置和取消只释放本会话的槽位。
     fn program_watchpoints(&mut self, addrs: &[u64]) {
         // 硬件只有 MAX_WATCHPOINTS 个比较器：入口先截断，让**本地列表长度与硬件
         // 实际能力一致**。否则超出部分既不会生效，又会让 on_halted 按 index 映射到
@@ -1005,37 +1065,59 @@ impl Engine {
         self.hot_warned = false;
         self.last_halt_at = None;
         self.pending_dwt = None;
+        self.watchpoints = addrs.to_vec();
+        self.clear_owned_watchpoints();
+        if addrs.is_empty() || self.backend.is_none() {
+            return;
+        }
         // 清掉上次命中留下的 DFSR.DWTTRAP（写 1 清除），否则刚武装后的第一次停机
         // 可能被这个陈旧标志误判成"观察点命中"
-        if let Some(dfsr) = self.with_backend(|b| b.read_u32(DFSR)) {
-            if dfsr & (1 << 2) != 0 {
-                self.with_backend(|b| b.write_u32(DFSR, dfsr));
+        if !self.backend.as_ref().is_some_and(|b| b.is_shared()) {
+            if let Some(dfsr) = self.with_backend(|b| b.read_u32(DFSR)) {
+                if dfsr & (1 << 2) != 0 {
+                    self.with_backend(|b| b.write_u32(DFSR, dfsr));
+                }
             }
         }
         // TRCENA：DWT 需要 DEMCR.TRCENA 才工作
         if let Some(demcr) = self.with_backend(|b| b.read_u32(DEMCR)) {
             self.with_backend(|b| b.write_u32(DEMCR, demcr | (1 << 24)));
         }
+        let mut requested = addrs.iter();
         for n in 0..MAX_WATCHPOINTS {
+            let Some(&addr) = requested.clone().next() else { break };
             let comp = DWT_COMP + 0x10 * n as u64;
             let mask = DWT_MASK + 0x10 * n as u64;
             let func = DWT_FUNCTION + 0x10 * n as u64;
-            // 先关比较器再改参数，避免重编程过程中产生假匹配
-            self.with_backend(|b| b.write_u32(func, 0));
-            if let Some(&addr) = addrs.get(n) {
-                self.with_backend(|b| b.write_u32(comp, addr as u32));
-                // MASK=2：匹配 4 字节区域
-                self.with_backend(|b| b.write_u32(mask, 2));
-                // 最后写 FUNCTION 使能（DATAVSIZE=4B，读或写触发停机）
-                self.with_backend(|b| b.write_u32(func, DWT_FN_DATA_RW_4B));
+            if self.owned_watchpoints.iter().any(|(slot, _)| *slot == n) {
+                continue; // 上次释放失败，不覆盖尚未确认的槽位。
+            }
+            if self.with_backend(|b| b.read_u32(func)).is_some_and(|f| f & 0xF == 0) {
+                let programmed = self.with_backend(|b| {
+                    b.write_u32(func, 0)?;
+                    b.write_u32(comp, addr as u32)?;
+                    // MASK=2：匹配 4 字节区域
+                    b.write_u32(mask, 2)?;
+                    // 最后写 FUNCTION 使能（DATAVSIZE=4B，读或写触发停机）
+                    b.write_u32(func, DWT_FN_DATA_RW_4B)
+                }).is_some();
+                if programmed {
+                    self.owned_watchpoints.push((n, addr));
+                    requested.next();
+                }
             }
         }
-        self.watchpoints = addrs.to_vec();
+        let remaining = requested.count();
+        if remaining > 0 {
+            self.emit(Event::Log {
+                message: format!("有 {remaining} 个数据观察点未设置：空闲 DWT 比较器不足或写入失败，已保留外部调试器的配置"),
+            });
+        }
         // 武装结束立刻取样：**这里比 poll_state 更早**，而且越早越可能还带着匹配标志 ——
         // OpenOCD 走 Tcl，每条 PPB 访问 ~1ms，随后的 `read_watchpoints()`（8 次读）
         // 足以把标志清掉（真机实测：probe-rs 能撑到 poll_state，OpenOCD 撑不到）。
         // 没有武装任何观察点时清空，避免留下无关的取样值。
-        self.pending_dwt = if addrs.is_empty() {
+        self.pending_dwt = if self.owned_watchpoints.is_empty() {
             None
         } else {
             Some(self.sample_dwt())
@@ -1048,14 +1130,14 @@ impl Engine {
         // 访问，点「继续」会在毫秒级内再次命中 —— 用户极易误以为"观察点取消了却还在停"。
         // 判定**不能只靠 FUNCTION.MATCHED**：实测部分停机不带该位，会漏报（踩过）。
         let now = Instant::now();
-        if !self.watchpoints.is_empty() && !self.hot_warned {
+        if !self.owned_watchpoints.is_empty() && !self.hot_warned {
             if let Some(prev) = self.last_halt_at {
                 if now.duration_since(prev) < Duration::from_millis(1500) {
                     self.hot_warned = true;
                     let list = self
-                        .watchpoints
+                        .owned_watchpoints
                         .iter()
-                        .map(|a| format!("0x{a:08x}"))
+                        .map(|(_, a)| format!("0x{a:08x}"))
                         .collect::<Vec<_>>()
                         .join(", ");
                     self.emit(Event::Log {
@@ -1077,7 +1159,7 @@ impl Engine {
         // 只看 DFSR 又会漏掉读命中。MATCHED 的额外价值是能定位**是哪个比较器**命中；
         // MATCHED 的时效性靠"命中后关→开比较器"维持（写 0 到 FUNCTION 清除该位）。
         // 这里只**记录**命中描述，日志统一在拿到 PC 之后发一行。
-        let watchpoints = self.watchpoints.clone();
+        let watchpoints = self.owned_watchpoints.clone();
         let mut watch_hit: Option<String> = None;
         if !watchpoints.is_empty() {
             // 优先用 `poll_state` 入口取样的原值（最早时刻，标志还没被 PPB 访问清掉）；
@@ -1088,9 +1170,10 @@ impl Engine {
                 _ => self.sample_dwt(),
             };
             let dwt_trap = dfsr & (1 << 2) != 0;
-            for (n, &addr) in watchpoints.iter().enumerate() {
+            for &(n, addr) in &watchpoints {
                 let func = DWT_FUNCTION + 0x10 * n as u64;
-                if fns.get(n).is_some_and(|fv| fv & (1 << 24) != 0) {
+                if fns.get(n).is_some_and(|fv| fv & (1 << 24) != 0) &&
+                    self.with_backend(|b| Self::watchpoint_is_ours(b.as_mut(), n, addr)) == Some(true) {
                     watch_hit = Some(format!("{addr:#010x}"));
                     self.with_backend(|b| b.write_u32(func, 0));
                     self.with_backend(|b| b.write_u32(func, DWT_FN_DATA_RW_4B));
@@ -1099,7 +1182,7 @@ impl Engine {
             // MATCHED 没能定位时，用 DFSR 兜底（写命中走这条路）
             if watch_hit.is_none() && dwt_trap {
                 watch_hit = Some(if watchpoints.len() == 1 {
-                    format!("{:#010x}", watchpoints[0])
+                    format!("{:#010x}", watchpoints[0].1)
                 } else {
                     format!("（已武装 {} 个之一）", watchpoints.len())
                 });
@@ -1467,13 +1550,23 @@ impl Engine {
         let t0 = self.epoch.elapsed().as_secs_f64();
         // 预热窗内的帧照常执行（维持总线节拍与 Core 预热），但输出丢弃
         let discard_until = self.scope_discard_until;
-        match self.with_backend(|bk| bk.scope_burst(&blocks, count, interval)) {
+        let burst_wall_start = Instant::now();
+        let burst_result = self.with_backend(|bk| bk.scope_burst(&blocks, count, interval));
+        self.perf_bursts += 1;
+        self.perf_burst_wall_us += burst_wall_start.elapsed().as_micros() as u64;
+        match burst_result {
             Some(frames) => {
+                let all_failed = !frames.is_empty() && frames.iter()
+                    .all(|(_, frame)| frame.iter().all(Vec::is_empty));
                 for (offset, frame) in frames {
                     if let Some(until) = discard_until {
                         if burst_start + offset < until {
                             continue;
                         }
+                    }
+                    self.perf_frames += 1;
+                    if frame.iter().any(Vec::is_empty) {
+                        self.perf_frames_degraded += 1;
                     }
                     let t = t0 + offset.as_secs_f64();
                     // 帧 = 与 blocks 同序的各块数据 → 配回块地址供 extract 使用
@@ -1483,19 +1576,18 @@ impl Engine {
                     }
                     let mut values = HashMap::with_capacity(self.scope_targets.len());
                     for target in &self.scope_targets {
-                        if let Some(bytes) =
-                            extract_from_blocks(&block_data, target.addr, target.size as usize)
-                        {
-                            values.insert(format!("0x{:08x}", target.addr), bytes);
-                        }
+                        let bytes = extract_from_blocks(&block_data, target.addr, target.size as usize)
+                            .unwrap_or_default();
+                        values.insert(format!("0x{:08x}", target.addr), bytes);
                     }
-                    if !values.is_empty() {
-                        self.scope_buffer.push(ScopeSample { t, values });
-                    }
+                    self.scope_buffer.push(ScopeSample { t, values });
                 }
                 // 一批覆盖 count 拍且批内节拍精确：下一批在 burst_span 之后或立即开始
                 let scheduled = burst_start + burst_span;
-                self.next_scope = if scheduled > Instant::now() {
+                self.next_scope = if all_failed {
+                    self.on_backend_error(BackendError::Transfer("示波突发全部块读取失败，已记录缺样".into()));
+                    Instant::now() + Duration::from_millis(50)
+                } else if scheduled > Instant::now() {
                     scheduled
                 } else {
                     Instant::now()
@@ -1513,7 +1605,8 @@ impl Engine {
             return;
         }
         let samples = std::mem::take(&mut self.scope_buffer);
-        self.emit(Event::ScopeData { samples });
+        let interval_us = (1e6 / self.scope_freq.max(1.0)) as u64;
+        self.emit(Event::ScopeData { samples, interval_us });
     }
 
     fn send_regs_and_stack(&mut self) {
@@ -1582,6 +1675,9 @@ fn extract_from_blocks(blocks: &[(u64, Vec<u8>)], addr: u64, size: usize) -> Opt
     }
     None
 }
+
+#[cfg(test)]
+mod regression_tests;
 
 #[cfg(test)]
 mod tests {

@@ -1,0 +1,249 @@
+请接手修复 Embedded Monitor 项目中示波采样不稳定、波形出现断点和坑洼的问题。本轮需要实际修改代码、验证并交付，不是只读审查。
+
+项目目录：
+E:\Software\Develop\Embeded\Clion_plugin\Embedded Debug tools
+
+下位机测试项目：
+E:\Software\Develop\Embeded\Pack\g4_tool_test
+
+测试 ELF：
+E:\Software\Develop\Embeded\Pack\g4_tool_test\cmake-build-debug-stm32\g4_tool_test.elf
+
+一、任务背景
+
+用户在上一轮修复后进行了真机复测，仍发现很多波形断点。用户实测三通道硬件采样能力约为 3 kHz，因此不能未经测量就把 1 kHz、甚至 200 Hz 下的几十毫秒缺口解释为硬件带宽不足。
+
+上一轮已经修复数值误改、缺样显示、地址重新定位及共享调试会话清理问题，但没有解决采样节拍不均匀和时间戳错位。请继续完成这部分修复，同时保留上一轮已经完成的工作。
+
+当前 Plugin 为 V1.2.29，Agent 为 1.2.29。工作区包含上一轮尚未提交的修改和新增文件，先检查 git status / git diff，基于现有修改增量实现，不要重置或覆盖这些内容。
+
+二、上一轮已经完成的修改，必须保留
+
+1. 移除生产数据路径中的 TornSampleFilter 自动修复。
+
+原算法会把正常浮点极值误判为撕裂值，并拼接相邻样本的字节来改写数值。例如：
+16.18034 → 20.0 → 16.18034
+中间的 20.0 会被改成 16.125；真机中还出现过正确负值被改为正值。
+
+已从 AgentService 的示波摄取和 ScopePanel 的 CSV 导出中移除调用。TornSampleFilter 仅保留为历史离线对照工具，不进入生产测量路径。
+不要重新引入自动平滑、削峰、插值、位模式重构等方法来掩盖问题。
+
+2. 新增 ScopeSamples，统一保存原始解码值与缺失状态。
+
+缺少目标字节、空字节、长度不匹配时保存 NaN，正常 F32 数据保持原始解码值。
+当前超过三个设定采样周期的时间间隔会设置 gapBefore。
+绘图先通过 forEachRun 分段，再做段内极值降采样，避免跨缺口连接。
+游标不会跨缺口吸附，也不会返回序列范围之外的值。
+
+3. 新增 ScopeCsv，修复导出对齐。
+
+按实际纳秒时间戳合并通道，缺失格子留空，不用最近邻填补其他通道。
+处理 CSV 表头转义，保存已采到的真实数值。
+
+4. 修复引擎与 OpenOCD 缺样语义。
+
+Engine 对已返回帧中的每个请求目标都输出对应地址；提取失败时输出空字节。
+OpenOCD 整批读取失败仍返回带时间戳的缺样帧，记录后执行 50 ms 避让。
+Tcl 传输损坏、失步或连接失败走 ConnectionLost，不能伪装为普通成功读取。
+注意：其他整批异常路径及超期漏拍是否仍缺少可观测性，需要继续检查。
+
+5. 修复共享 OpenOCD 会话的清理行为。
+
+新增 DebugBackend.is_shared，OpenOCD 根据实际是否拥有子进程判断共享关系，覆盖 attachOnly=false 但复用已有服务器的情况。
+Engine 跟踪自己分配的 DWT 槽位和地址，分配时保留外部占用。
+清理前核对 COMP/MASK/FUNCTION，忽略只读状态位；外部改写后的槽位不清除。
+Disconnect、连接替换及 Shutdown 使用一致清理路径。
+共享目标处于暂停状态时，不自动 resume；不能清空其他调试器的观察点。
+
+6. 修复示波通道的符号和指针绑定。
+
+新增 ScopeTargetResolver。
+ELF 重载、重连、恢复采样时重新解析表达式；指针链使用现场读取的指针值，支持嵌套指针和数组。
+地址或长度变化时清理对应旧序列；无法定位时暂停该通道并显示“待定位”。
+固定地址与 SVD 寄存器通道保留固定绑定，兼容旧持久化配置。
+ScopeVariable、持久化设置及 RegisterLiveWatchPanel 已做配套修改。
+示波目标下发通过 pushExecutor 串行执行，避免旧地址请求覆盖新地址。
+
+7. 其他已完成修改。
+
+相同目标和频率重复下发时，不再重复触发 150 ms 预热丢弃。
+真正改变目标时清空 Engine 旧缓冲。
+修正 check_bandwidth 的协议参数，使用 [[addr,size],...]，告警占用标明为估算。
+更新版本、CHANGELOG、回归测试及修复记录。
+
+三、上一轮验证与产物
+
+修复记录：
+E:\Software\Develop\Embeded\Clion_plugin\Embedded Debug tools\docs\reviews\2026-10-01-scope-fix.md
+
+修复前审查：
+E:\Software\Develop\Embeded\Clion_plugin\Embedded Debug tools\docs\reviews\2026-09-30-scope-audit.md
+
+证据目录：
+E:\Software\Develop\Embeded\Clion_plugin\Embedded Debug tools\tmp\scope-audit-20260930
+
+上一轮 Rust workspace 测试 58 项通过，Plugin 测试 145 项通过。
+83,185 帧旧记录经当前生产 ScopeSamples / ScopeCsv 回放，存储和导出的数值改写为 0。
+故障注入验证了部分缺样、整批缺样，以及共享退出时保留外部 DWT 和暂停状态。
+这些结果证明相关回归通过，不证明采样连续稳定。
+
+已有安装包：
+E:\Software\Develop\Embeded\Clion_plugin\Embedded Debug tools\release\embedded-debug-plugin-V1.2.29-standalone.zip
+
+ZIP SHA-256：
+6510d5a6a77dc2894f753c1f7a67d6f7b2aa10d0a198b5336dbefba99feb56b5
+
+Agent SHA-256：
+be7a454e0d9db28beb5f69bac2120fcd907b89f17f8db6f93720b5feb4d1ba1c
+
+后续只读审查已经核对：安装的 Plugin 是 V1.2.29，运行中的 Agent 文件哈希与上述一致。因此不要默认把问题归因于用户仍在使用旧安装包。
+
+四、后续审查发现的剩余问题
+
+1. 时间戳与实际采集时刻错位。
+
+关键源码：
+E:\Software\Develop\Embeded\Clion_plugin\Embedded Debug tools\agent\crates\debug-core\src\probers_backend.rs
+E:\Software\Develop\Embeded\Clion_plugin\Embedded Debug tools\agent\crates\debug-core\src\openocd.rs
+
+两个 scope_burst 都在读完所有块后执行 out.push((start.elapsed(), frame))，整个帧共用读取结束时间。回包等待、读取过程及线程调度延迟被混进时间戳，分散地址的多个通道也没有独立采集时序。
+
+直接证据：
+E:\Software\Develop\Embeded\Clion_plugin\Embedded Debug tools\tmp\scope-audit-20260930\fixed_ocd_200_user.csv
+第 1455—1457 行附近：
+
+相邻帧 Agent 时间戳间隔 56.183 ms，MCU tick 只增加 6 ms；
+下一帧时间戳间隔 0.679 ms，MCU tick 却增加 52 ms。
+后一对帧的 sin_1hz 从约 15.81 变为 46.61，却被放在仅隔 0.679 ms 的时间位置。
+
+这表明数值和时间标签错位。这里既可能存在实际漏采，也存在缺口位置及大小的失真，必须区分。
+不要简单把打点从读取结束移到读取开始，就声称时间准确；应结合采集时间窗、块间时序及目标 tick 验证。
+
+2. 批内使用普通 sleep，超期后追赶旧截止时间。
+
+两个后端都使用：
+due = start + interval * (i + 1)
+若 now < due，则 thread::sleep(due - now)。
+
+外层 Engine 的粗睡眠与忙等没有覆盖真正的批内采样等待。
+超期后循环仍沿用旧截止时间，随后连续快速读取。平均速率可能接近目标，但实际间隔不均匀，错过的历史波形无法通过追赶读取补回。
+
+fixed_ocd_200_user 中的 18 次超过 15 ms 的间隔，全部发生在同一批次内部；该用例每批 8 帧。因此不能仅用批间切换或状态轮询解释这些长间隔。
+
+3. 其他操作占用同一个采样线程。
+
+关键源码：
+E:\Software\Develop\Embeded\Clion_plugin\Embedded Debug tools\agent\crates\monitor\src\lib.rs
+
+Engine 主循环依次处理命令、Watch、状态轮询、Scope 和事件推送。
+drain_commands 一直处理到队列为空，没有采样预算。
+ReadMemSync、Watch、寄存器读取等操作与 Scope 共用后端线程。
+状态轮询间隔为 150 ms；probe-rs 每批重新获取 Core。
+
+需要量化这些操作造成的空档，并优化调度和重复读取。可以重构线程或调度，但同一探针、Session、Core 或 Tcl 流的访问仍必须正确串行化，不能引入并发访问冲突。
+
+4. 配置生效与前端判定不同步。
+
+关键源码：
+E:\Software\Develop\Embeded\Clion_plugin\Embedded Debug tools\plugin\src\main\kotlin\org\embedded\monitor\agent\AgentService.kt
+E:\Software\Develop\Embeded\Clion_plugin\Embedded Debug tools\agent\crates\embedded-clion-agent\src\session.rs
+
+setScopeFreq 先修改前端 currentScopeFreqHz，再通过线程池异步下发；多个请求可能乱序。
+set_scope_targets / set_scope_freq 的 RPC 应答只表示入队，不表示 Engine 已执行。
+ScopeData 没有配置代次，旧在途帧可能被按新地址或新频率解释。
+例如实际后台仍为 200 Hz、前端已按 1000 Hz 判定时，正常约 5 ms 间隔也会触发 3 ms 断线阈值。
+
+考虑串行、原子配置、执行确认或配置代次等机制，防止旧帧被误解释。
+同时检查重连续接时间和强制单调时间修正是否掩盖时间问题。
+
+5. 当前断线规则和预热丢弃需要复核。
+
+ScopeSamples 当前按超过三个设定周期断线：
+1000 Hz：超过 3 ms；
+200 Hz：超过 15 ms。
+
+因此“保留帧都有完整字节”与“没有波形断点”是两件事。
+目标或频率真正改变时，rebuild_scope_blocks 仍会丢弃随后 150 ms 的采样。
+请定位预热异常来源、评估必要性和替代方案；不要为了消除缺口而放宽阈值、隐藏缺失或输出预热垃圾。
+
+6. 带宽模型与测试验收不足。
+
+bandwidth 模型固定使用 750,000 B/s 和每块 375 字节开销。
+用户三个通道的布局为两个读块，在 1000 Hz 会估算出 766,000 B/s 并告警。这个结果不是硬件实测，check_bandwidth 也不执行限速。
+应校准估算或修正告警表述，不能据此认定用户已耗尽硬件带宽。
+
+现有 scope_sampling_rate_1khz 测试只要求 1.2 秒至少 700 点，并检查间隔中位数在 0.6—1.8 ms；不检查最坏间隔或时间标签准确性，长空档仍可能通过。
+新增有意义的时序回归，覆盖延迟注入、超期处理、配置切换和共享会话行为。
+
+五、已有真机基线
+
+设备：STM32G431CBTx + Flash Pro(CMSIS-DAP)，上一轮测试使用 4 MHz SWD。
+
+用户三个通道：
+sin_1hz
+sin_20hz
+g_chassis_ptr._ctx.data[0].vx
+
+上一轮从真实 ELF 和现场指针确认的地址分别为：
+0x20000094
+0x2000009c
+0x2000044c
+
+这些地址只作为历史对照，重新实测时应重新解析，不要硬编码。
+
+上一轮每组约 10 秒的有效数据中，“诊断 + 用户 vx”为六通道、两个读块：
+
+probe-rs，1000 Hz：985.9 Hz，时间戳最大间隔 4.55 ms，超过三个周期 10 次。
+OpenOCD，1000 Hz：863.0 Hz，最大间隔 41.53 ms，超过三个周期 288 次。
+probe-rs，200 Hz：196.2 Hz，最大间隔 10.51 ms，超过三个周期 0 次。
+OpenOCD，200 Hz：191.0 Hz，最大间隔 56.18 ms，超过三个周期 18 次。
+
+这些是上一轮记录，不是用户最新三通道复测结果。不要混用条件，或直接把 Agent 时间戳长间隔等同于准确的实际采集空档。
+CSV 的 host 字段是整批到达时间，也不能作为逐样本采集时间。
+
+六、实施和验收要求
+
+先复核现有实现和原始数据，再增加低开销、可开关的分段耗时统计，区分：
+等待超期、Core 获取、每块读取、返回处理、Watch/状态读取、命令处理及事件发送。
+不要逐样本打印大量日志干扰采样。
+
+修复重点：
+连续采样节拍、正确的时间语义、受控的其他读取调度、配置生效一致性。
+保留原始测量值、缺失状态、错误信息和共享调试会话保护。
+评估 CPU 占用和停止/断开/断点响应，避免用无节制忙等换取表面稳定。
+
+允许真机复测，优先使用现有固件。先检查现场设备连接和目标运行状态，避免争抢正在使用的探针。
+阅读现有 capture.py、check_shared_hardware.py 等脚本再运行，它们存在连接、寄存器或目标状态控制行为。
+历史报告中的最终 halted 状态已经过时，不能当成当前现场状态。
+结束后恢复进入测试时的目标状态，只清理自己创建的进程和配置。
+
+在相同环境下做修复前后对照，重点覆盖：
+两个后端；
+用户实际三个通道；
+200 Hz 和 1000 Hz；
+Scope 单独运行，以及叠加 Watch/必要寄存器刷新；
+快速改频、增删通道、重连和异常读取。
+每个关键稳定性用例建议持续至少 30—60 秒，3 kHz 可作为边界能力补充测试。
+最终也要核对 Plugin 的真实配置和数据消费路径，不能只验证裸 Agent。
+
+报告平均 Hz、间隔 p50/p95/p99/最大值、超过三个周期次数、缺值、实际漏拍、数值正确性及时间戳与 MCU tick 的对应关系。
+不能仅因平均速率接近目标或数值校验通过，就宣称波形稳定。
+对残余停顿说明证据和原因，不要未经测量笼统归咎于 Windows 或硬件。
+
+运行 Rust 和 Plugin 的适当回归检查。
+上一轮命令为：
+在项目的 agent 目录执行 cargo test --workspace --locked --offline；
+在项目的 plugin 目录执行 gradlew.bat test --offline --console=plain。
+
+可用工具链参考：
+Cargo：E:\Software\rust_env\cargo\bin\cargo.exe
+JDK：C:\Users\zhou_\.gradle\jdks\eclipse_adoptium-25-amd64-windows.2
+OpenOCD：E:\Software\Develop\Embeded\OpenOCD\xpack-openocd-0.12.0-7\bin\openocd.exe
+
+七、交付
+
+完成源码修复和必要协议/前端配套，按项目规则递增版本。
+生成包含新 Agent 的安装 ZIP，核对内置 Agent 与实测二进制、插件版本和哈希一致。
+更新修复记录，保留原始测量证据，说明改善幅度及仍未解决的问题。
+
+严格等间隔采样若最终需要下位机定时采集、缓存和时间戳，可作为后续方案说明；先解决已经确认的主机软件缺陷，不要用硬件方案替代本轮 Agent 修复。

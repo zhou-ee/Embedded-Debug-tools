@@ -27,6 +27,11 @@ pub trait DebugBackend: Send {
     fn disconnect(&mut self);
     fn is_connected(&self) -> bool;
 
+    /// 是否复用外部调试器的连接；共享会话的暂停状态由外部调试器管理。
+    fn is_shared(&self) -> bool {
+        false
+    }
+
     fn read_bytes(&mut self, addr: u64, len: usize) -> Result<Vec<u8>, BackendError>;
     fn write_bytes(&mut self, addr: u64, data: &[u8]) -> Result<(), BackendError>;
 

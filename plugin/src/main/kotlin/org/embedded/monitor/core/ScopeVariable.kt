@@ -11,6 +11,9 @@ data class ScopeVariable @JvmOverloads constructor(
     val colorIndex: Int = 0,
     var visible: Boolean = true,
     var customColor: Color? = null,
+    /** 可重新定位的符号表达式；null 表示用户指定的固定地址。 */
+    val expression: String? = null,
+    @Volatile var resolved: Boolean = true,
 )
 
 /** 曲线调色板（对齐独立软件 software_ref PALETTE: #61afef, #98c379, #e06c75, #e5c07b, #c678dd, #56b6c2）。 */
@@ -32,4 +35,4 @@ object ScopePalette {
 }
 
 /** 单个采样点：纳秒时间戳 + 解码后的浮点值（NaN 表示读失败，画布断线）。 */
-data class ScopeSample(val timestampNanos: Long, val value: Float)
+data class ScopeSample(val timestampNanos: Long, val value: Float, val gapBefore: Boolean = false)

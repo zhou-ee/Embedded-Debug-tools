@@ -289,7 +289,7 @@ fn main() {
         let mut samples: Vec<(f64, u32)> = Vec::new();
         while Instant::now() < deadline {
             match rx.recv_timeout(Duration::from_millis(200)) {
-                Ok(Event::ScopeData { samples: batch }) => {
+                Ok(Event::ScopeData { samples: batch, .. }) => {
                     for s in batch {
                         for (k, bytes) in &s.values {
                             if k == &format!("0x{uw_addr:08x}") && bytes.len() >= 4 {

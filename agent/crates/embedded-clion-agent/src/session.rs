@@ -349,6 +349,20 @@ impl Session {
                     Err(_) => return Err("写内存超时（引擎忙或未连接）".to_string()),
                 }
             }
+            "scope_perf" => {
+                let cmd_tx = self
+                    .cmd_slot
+                    .lock()
+                    .clone()
+                    .ok_or("引擎未启动，先调用 connect")?;
+                let (reply_tx, reply_rx) = bounded(1);
+                let _ = cmd_tx.send(Command::ScopePerf { reply: reply_tx });
+                match reply_rx.recv_timeout(std::time::Duration::from_secs(2)) {
+                    Ok(Ok(v)) => self.send(response_ok(id, v)),
+                    Ok(Err(e)) => return Err(e),
+                    Err(_) => return Err("scope_perf 超时".to_string()),
+                }
+            }
             "check_bandwidth" => {
                 let targets: Vec<(u64, u64)> = serde_json::from_value(
                     p.get("targets").cloned().ok_or("缺少 targets")?,

@@ -24,6 +24,9 @@ data class PersistedScopeChannel(
     var colorIndex: Int = 0,
     var visible: Boolean = true,
     var customColorRgb: Int = -1,
+    var expression: String = "",
+    /** 旧配置缺省 false，可按通道名称迁移为符号绑定。 */
+    var fixedAddress: Boolean = false,
 )
 
 /**

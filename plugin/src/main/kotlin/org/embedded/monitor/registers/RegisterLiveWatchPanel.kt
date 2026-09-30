@@ -339,7 +339,7 @@ class RegisterLiveWatchPanel(private val project: Project) : JBPanel<RegisterLiv
                     addActionListener {
                         val reg = selectedRegister
                         if (reg != null) {
-                            agentService?.addScopeVariable(reg.name, reg.address, reg.size, "unsigned")
+                            agentService?.addScopeVariable(reg.name, reg.address, reg.size, "unsigned", fixedAddress = true)
                             Messages.showInfoMessage(project, "已将 ${reg.name} (0x%08X) 添加到示波器通道".format(Locale.ROOT, reg.address), "添加成功")
                         }
                     }
@@ -583,7 +583,7 @@ class RegisterLiveWatchPanel(private val project: Project) : JBPanel<RegisterLiv
 
         menu.add(JMenuItem("添加到示波器", AllIcons.Toolwindows.ToolWindowPalette).apply {
             addActionListener {
-                agentService?.addScopeVariable(reg.name, reg.address, reg.size, "unsigned")
+                agentService?.addScopeVariable(reg.name, reg.address, reg.size, "unsigned", fixedAddress = true)
                 Messages.showInfoMessage(project, "已将 ${reg.name} (0x%08X) 添加到示波器通道".format(Locale.ROOT, reg.address), "添加成功")
             }
         })
