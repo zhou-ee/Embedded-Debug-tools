@@ -63,6 +63,8 @@ pub struct ProbeRsBackend {
     speed_hz: u32,
     /// 按序列号选择探针（多探针系统；None = 第一个可用）
     probe_serial: Option<String>,
+    /// 示波全局帧计数（跨突发持续，监视插帧节拍用）
+    watch_frame_counter: u64,
     session: Option<Session>,
     /// core() 连续失败计数
     core_fail_streak: u32,
@@ -74,6 +76,7 @@ impl ProbeRsBackend {
             target,
             speed_hz,
             probe_serial: None,
+            watch_frame_counter: 0,
             session: None,
             core_fail_streak: 0,
         }
@@ -91,6 +94,7 @@ impl ProbeRsBackend {
             target,
             speed_hz,
             probe_serial: None,
+            watch_frame_counter: 0,
             session: Some(session),
             core_fail_streak: 0,
         }
@@ -293,9 +297,28 @@ impl DebugBackend for ProbeRsBackend {
         count: usize,
         interval: Duration,
     ) -> Result<BurstFrames, BackendError> {
+        self.scope_burst_watch(blocks, &[], 0, count, interval)
+            .map(|(frames, _)| frames)
+    }
+
+    /// 监视读插帧版本：帧 push 后若到达监视帧序（全局帧计数对 watch_every 取模），
+    /// 在帧间节拍窗读监视块——监视读耗时由超期重锚定自然吸收（只影响该帧间隔），
+    /// 读失败仅丢该次监视值（空字节 → 前端缺样标记），不影响示波帧。
+    fn scope_burst_watch(
+        &mut self,
+        blocks: &[(u64, usize)],
+        watch_blocks: &[(u64, usize)],
+        watch_every: usize,
+        count: usize,
+        interval: Duration,
+    ) -> Result<(BurstFrames, Vec<Vec<Vec<u8>>>), BackendError> {
+        let (out, watch_out, watch_frame_counter) = {
+        // 计数器先拷贝为局部：core 借用 self 期间不能触碰 self 字段
+        let mut watch_frame_counter = self.watch_frame_counter;
         let start = Instant::now();
         let mut core = self.core()?;
         let mut out = Vec::with_capacity(count);
+        let mut watch_out: Vec<Vec<Vec<u8>>> = Vec::new();
         // 帧节拍：读耗时超过间隔时，截止时刻重锚到"当前 + 间隔"，不追赶旧截止——
         // 旧实现超期后沿用旧截止连续快速读取，批内间隔忽快忽慢
         // 区域校验提升到突发级一次预计算：memory_regions() 每次调用会构造区域表，
@@ -397,17 +420,30 @@ impl DebugBackend for ProbeRsBackend {
                 frame.push(buf);
             }
             out.push((frame_ts, frame));
-            // 节拍推进：先按间隔推进截止时刻（周期严格均匀，V1.2.30 的
-            // "读完 now 必然 > due → 每帧重锚" 会使周期变成 间隔+读耗时，
-            // 980Hz 掉到 ~700Hz）；仅当读耗时超过间隔、已落后于推进后的
-            // 截止时才重锚到"当前 + 间隔"（不追赶旧截止，不积累追赶风暴）
+            // 监视读插帧：全局帧计数到达监视节拍时，在帧间节拍窗读监视块
+            // （读耗时由超期重锚定自然吸收）；失败丢该次监视值（空字节 → 前端缺样）
+            if watch_every > 0 && (watch_frame_counter + 1) % watch_every as u64 == 0 {
+                let mut wblocks = Vec::with_capacity(watch_blocks.len());
+                for (waddr, wlen) in watch_blocks {
+                    let mut wb = vec![0u8; *wlen];
+                    let _ = core.read_8(*waddr, &mut wb);
+                    wblocks.push(wb);
+                }
+                watch_out.push(wblocks);
+            }
+            watch_frame_counter += 1;
+            // 节拍推进：先按间隔推进截止（周期严格均匀）；仅当读耗时超过间隔、
+            // 已落后于推进后的截止时才重锚（不追赶旧截止，不积累追赶风暴）
             due += interval;
             let now = Instant::now();
             if now > due {
                 due = now + interval;
             }
         }
-        Ok(out)
+        (out, watch_out, watch_frame_counter)
+        };
+        self.watch_frame_counter = watch_frame_counter;
+        Ok((out, watch_out))
     }
 
     fn hw_breakpoint_quota(&mut self) -> Option<(usize, usize)> {

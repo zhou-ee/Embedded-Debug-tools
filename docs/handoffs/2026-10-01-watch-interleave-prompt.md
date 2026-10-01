@@ -40,3 +40,15 @@
 - Engine 侧接线：sample_scope 计算 watch_every = watch_interval/interval；监视字节
   按 WatchData 事件（values 以 MemTarget.id 为键）解码发送，推进 next_watch。
 - 回归基线：cargo 58/0、gradle 145/0。
+
+## 进度二（2026-10-01 第三段）
+- trait scope_burst_watch 已加入 debug-core/src/lib.rs（默认实现 = 回退 scope_burst 不插帧）。
+- probe-rs 的 scope_burst 已改造为 scope_burst_watch（签名加 watch_blocks/watch_every、
+  返回 (BurstFrames, Vec<Vec<Vec<u8>>>)、帧 push 后按全局帧计数插监视读、
+  watch_frame_counter 字段+局部拷贝规避 core 借用冲突、内部块包装解决 Core Drop 借用延伸）。
+  scope_burst 保留为委托包装。cargo 58/0。
+- 待办：openocd 同名改造（其 scope_burst 含 total_blocks/degraded/last_degrade_log
+  降级统计与限流，改造时保持语义；用 Read+Edit 精确编辑而非 python 字符串手术）；
+  Engine sample_scope 接线（watch_every = watch_interval/scope_interval，监视字节按
+  WatchData 事件解码，values 以 MemTarget.id 为键）；调试期轮询挂起
+  （set_poll_suppression 协议命令 + 插件在 attachDebugSession/disconnect 时设置）。
