@@ -3,6 +3,51 @@
 > **路径映射说明**：V1.2.x 历史条目中的 `software_ref/` 对应本仓库现在的 `agent/`，
 > `package_release.py` 对应 `package.py`（项目在开源重构前为 software_ref 单体工程）。
 
+## [V1.2.35] — 示波失败分级恢复 + 监视插帧接线 + 命令预算（P1/P2 审查修复）
+
+### Agent (v1.2.35)
+- **大块读失败逐字降级（P1-2）**：probe-rs 帧内 `read_32` 冲刺读+重试仍失败且块
+  >4B 时，降为逐字读（探测 CMSIS-DAP 固件 BlockTransfer 大小限制），成功部分
+  拼回——把整块缺样收敛为部分缺样；单字失败仍记空字节（该目标本帧缺值）；
+- **插帧监视读升级 read_32（P1-2 同源）**：4 对齐监视块插帧读改走 `read_32`
+  （单事务 ~100-200µs；read_8 逐字节 ~900µs 会顶起下一帧节拍），失败记空字节
+  缺样（修复旧插帧实现失败时塞零值假数据的问题）；
+- **监视插帧正式接线（P1-3）**：引擎 `sample_scope` 改调 `scope_burst_watch`——
+  监视目标按 halted/auto_refresh 过滤合并成块，按 监视频率/示波频率 比折算
+  每 N 帧插一次；每批最后一帧监视值直接经 WatchData 下发。仅当
+  `supports_watch_interleave`（新 trait 能力探测，probe-rs/openocd = true，
+  sim = false）且示波频率 > 监视频率时启用；突发失败自动回落独立监视采样；
+- **整批失败自适应退避（P1-1）**：固定 50ms → 2ms 起 2^n 指数升级、50ms 封顶，
+  成功即清零——瞬时 USB 忙/NoAcknowledge 不再白吃 50ms 空档（1kHz 下即 50 帧），
+  持续失败仍有防刷屏上限；
+- **引擎命令预算（P2）**：`drain_commands` 每轮最多 32 条；预算耗尽后等待上限
+  压至 2ms 忙等——命令积压分批与示波/监视交错推进，ReadMemSync（最长 2s）
+  洪峰不再独占采样线程。
+
+### 插件 (V1.2.35)
+- 版本联动，无协议变更。
+
+### 真机验证（STM32G431CBTx + Flash Pro，probe-rs，1kHz 三通道，12s/场景）
+- **1kHz 基线**（sin_1hz + sin_20hz + chassis 指针目标）：**993.4Hz**，
+  p50/p95 = 1.00ms，p99 = 1.34ms，max = 7.87ms，>3 周期空档 5 个/12s；
+- **1kHz + 15Hz watch 插帧**：**991.7Hz**（Δ = -1.7Hz，插帧开销 ≈ 0），
+  watchData **179 条/12s**（15Hz 预期 ~180，恰好满节拍），max 11.8ms；
+  插帧监视读 4 对齐块已走 read_32 单事务；
+- scope_perf 全程 58k+ 帧：framesDegraded = 0、probeBlocksDegraded = 0、
+  probeRead32Retries = 0（逐字降级/冲刺读路径本场合零触发）；
+- **3kHz 记录性结论**：诚实节拍（超期重锚定，不追赶）下 3 通道 2 读块
+  ~570µs/帧 → 实测 ~1.76kHz。旧版"~2800Hz"来自超期后不均匀的追赶连读
+  （V1.2.30 已废弃该行为）。用户确认主场景为 1kHz，3kHz 提升留待后续
+  （可选路径：间隙容忍合并减少每帧事务数 / 下位机定时采集）。
+
+### 回归
+- cargo test 60/0（新增：整批失败退避升级序列、fail_backoff 纯函数边界、
+  插帧 WatchData 下发与 watch_interleave_active 标志）；clippy 0 警告；
+- sim 集成 `test_watch_15hz_...` 10Hz 段断言 7..=9 → 5..=9：sim 后端走 trait
+  默认 `scope_burst`（60ms 阻塞突发），监视只能落批间空隙，实际周期量化到
+  max(100ms, 批界)——HEAD 基线即稳定 6 次，非本轮回归；下限 5 防饥饿、上限 9
+  防"仍停留在 15Hz"（该意图不变）。
+
 ## [V1.2.34] — 监视读插入示波突发 + 调试期轮询挂起（用户指定设计）
 
 > **用户真机反馈（2026-10-01）**：1kHz 仍有坑洼空档；提出方案——时间容差大的

@@ -1,5 +1,5 @@
 use super::*;
-use debug_core::BurstFrames;
+use debug_core::{BurstFrames, WatchFrames};
 use std::sync::{Arc, Mutex};
 
 #[derive(Default)]
@@ -11,6 +11,7 @@ struct RecordedState {
     disconnects: usize,
     halted: bool,
     burst: BurstFrames,
+    watch_burst: Vec<Vec<Vec<u8>>>,
 }
 
 struct RecordingBackend {
@@ -30,6 +31,9 @@ impl DebugBackend for RecordingBackend {
     }
     fn is_shared(&self) -> bool {
         self.shared
+    }
+    fn supports_watch_interleave(&self) -> bool {
+        true
     }
     fn read_bytes(&mut self, addr: u64, len: usize) -> Result<Vec<u8>, BackendError> {
         let state = self.state.lock().unwrap();
@@ -88,6 +92,17 @@ impl DebugBackend for RecordingBackend {
         _interval: Duration,
     ) -> Result<BurstFrames, BackendError> {
         Ok(self.state.lock().unwrap().burst.clone())
+    }
+    fn scope_burst_watch(
+        &mut self,
+        _blocks: &[(u64, usize)],
+        _watch_blocks: &[(u64, usize)],
+        _watch_every: usize,
+        _count: usize,
+        _interval: Duration,
+    ) -> Result<(BurstFrames, WatchFrames), BackendError> {
+        let state = self.state.lock().unwrap();
+        Ok((state.burst.clone(), state.watch_burst.clone()))
     }
 }
 
@@ -291,10 +306,71 @@ fn totally_failed_burst_keeps_missing_samples_and_backs_off() {
     engine.sample_scope();
     assert_eq!(engine.scope_buffer.len(), 1);
     assert!(engine.scope_buffer[0].values["0x20000000"].is_empty());
+    // 自适应退避：首次整批失败 2ms 快速重试（固定 50ms 会让瞬时失败白吃 50ms 空档）
+    assert!(engine.next_scope >= Instant::now() + Duration::from_millis(1));
+    assert!(engine.next_scope < Instant::now() + Duration::from_millis(10));
+    // 连续失败指数升级，50ms 封顶
+    for _ in 0..8 {
+        engine.sample_scope();
+    }
     assert!(engine.next_scope >= Instant::now() + Duration::from_millis(40));
+    assert!(engine.next_scope < Instant::now() + Duration::from_millis(120));
     assert!(events
         .try_iter()
         .any(|event| matches!(event, Event::Error { message } if message.contains("已记录缺样"))));
+}
+
+#[test]
+fn fail_backoff_escalates_and_caps_at_50ms() {
+    assert_eq!(Engine::fail_backoff(1), Duration::from_millis(2));
+    assert_eq!(Engine::fail_backoff(2), Duration::from_millis(4));
+    assert_eq!(Engine::fail_backoff(3), Duration::from_millis(8));
+    assert_eq!(Engine::fail_backoff(5), Duration::from_millis(32));
+    assert_eq!(Engine::fail_backoff(6), Duration::from_millis(50));
+    assert_eq!(Engine::fail_backoff(100), Duration::from_millis(50));
+}
+
+#[test]
+fn watch_interleave_emits_latest_watch_data_and_sets_flag() {
+    let (mut engine, state, events) = engine(true);
+    engine.handle_command(Command::UpdateScopeTargets(vec![ScopeTarget {
+        addr: 0x20000000,
+        size: 4,
+    }]));
+    engine.handle_command(Command::UpdateWatchTargets(vec![MemTarget {
+        id: "live_val".into(),
+        addr: 0x20000004,
+        size: 4,
+        auto_refresh: true,
+    }]));
+    engine.handle_command(Command::SetScopeFreq(1000.0));
+    engine.scope_discard_until = None;
+    // 插帧监视数据：块 [0x20000004+4B] 一帧有效一帧失败（空字节）
+    *state.lock().unwrap() = RecordedState {
+        burst: vec![
+            (Duration::from_millis(1), vec![2.5f32.to_le_bytes().to_vec()]),
+            (Duration::from_millis(2), vec![3.5f32.to_le_bytes().to_vec()]),
+        ],
+        watch_burst: vec![
+            vec![1.0f32.to_le_bytes().to_vec()],
+            vec![vec![]],
+            vec![2.0f32.to_le_bytes().to_vec()],
+        ],
+        ..Default::default()
+    };
+    engine.sample_scope();
+    assert!(engine.watch_interleave_active, "示波 1kHz > 监视 5Hz 应插帧");
+    let mut saw_watch = false;
+    for event in events.try_iter() {
+        if let Event::WatchData { values, halted } = event {
+            saw_watch = true;
+            assert!(!halted);
+            assert_eq!(values["live_val"], 2.0f32.to_le_bytes(), "只推最后一帧监视值");
+        }
+    }
+    assert!(saw_watch, "插帧监视读应产生 WatchData");
+    // 示波帧正常入缓冲
+    assert_eq!(engine.scope_buffer.len(), 2);
 }
 
 #[test]

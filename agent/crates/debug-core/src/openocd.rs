@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use crate::{BackendError, BurstFrames, DebugBackend};
+use crate::{BackendError, BurstFrames, DebugBackend, WatchFrames};
 
 const TCL_PORT: u16 = 6666;
 const FRAME: u8 = 0x1a; // Ctrl+Z
@@ -524,6 +524,10 @@ impl DebugBackend for OpenOcdBackend {
             .map(|(frames, _)| frames)
     }
 
+    fn supports_watch_interleave(&self) -> bool {
+        true
+    }
+
     /// 监视读插帧版本（openocd 路径）：帧 push 后若到达监视帧序，在帧间节拍窗
     /// 以 Tcl 命令读监视块；读失败仅丢该次监视值（空字节 → 前端缺样标记）。
     fn scope_burst_watch(
@@ -533,7 +537,7 @@ impl DebugBackend for OpenOcdBackend {
         watch_every: usize,
         count: usize,
         interval: Duration,
-    ) -> Result<(BurstFrames, Vec<Vec<Vec<u8>>>), BackendError> {
+    ) -> Result<(BurstFrames, WatchFrames), BackendError> {
         let start = Instant::now();
         let mut out = Vec::with_capacity(count);
         let mut watch_out: Vec<Vec<Vec<u8>>> = Vec::new();
@@ -622,7 +626,7 @@ impl DebugBackend for OpenOcdBackend {
             }
             out.push((frame_ts, frame));
             // 监视读插帧：全局帧计数到达监视节拍时读监视块（读失败丢该次监视值）
-            if watch_every > 0 && (self.watch_frame_counter + 1) % watch_every as u64 == 0 {
+            if watch_every > 0 && (self.watch_frame_counter + 1).is_multiple_of(watch_every as u64) {
                 let mut wblocks = Vec::with_capacity(watch_blocks.len());
                 for (waddr, wlen) in watch_blocks {
                     let resp = self.tcl(&format!("read_memory 0x{waddr:x} 32 {}", wlen / 4))?;

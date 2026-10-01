@@ -10,6 +10,9 @@ use std::time::{Duration, Instant};
 /// 示波突发帧：[(自突发开始的耗时, 块数据列表)]
 pub type BurstFrames = Vec<(Duration, Vec<Vec<u8>>)>;
 
+/// 监视插帧数据：帧序 → 各监视块字节（块序与 watch_blocks 一致）
+pub type WatchFrames = Vec<Vec<Vec<u8>>>;
+
 pub mod flash;
 pub mod openocd;
 #[cfg(windows)]
@@ -76,6 +79,13 @@ pub trait DebugBackend: Send {
 
     fn read_core_register(&mut self, name: &str) -> Result<u64, BackendError>;
 
+    /// 是否真正实现了监视读插帧（engine 据此决定跳过独立监视采样）。
+    /// 默认 false：默认 scope_burst_watch 只是委托 scope_burst 并丢弃监视数据，
+    /// 不加探测会让 sim 等后端在插帧激活期监视数据断流。
+    fn supports_watch_interleave(&self) -> bool {
+        false
+    }
+
     /// 示波突发 + 监视读插帧：在帧间节拍窗内按 watch_every 帧间隔插入监视块读
     /// （监视节拍要求低、时间容差大，塞进示波帧间空闲窗避免独立占用总线造成空档）。
     /// 返回 (示波帧, 监视帧数据[帧序 → 各监视块字节])。默认不插帧（Sim 等回退）。
@@ -86,7 +96,7 @@ pub trait DebugBackend: Send {
         _watch_every: usize,
         count: usize,
         interval: Duration,
-    ) -> Result<(BurstFrames, Vec<Vec<Vec<u8>>>), BackendError> {
+    ) -> Result<(BurstFrames, WatchFrames), BackendError> {
         let frames = self.scope_burst(blocks, count, interval)?;
         Ok((frames, Vec::new()))
     }

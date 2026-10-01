@@ -3,7 +3,7 @@
 use probe_rs::{CoreInterface, MemoryInterface, Permissions, Session};
 use std::time::{Duration, Instant};
 
-use crate::{BackendError, BurstFrames, DebugBackend};
+use crate::{BackendError, BurstFrames, DebugBackend, WatchFrames};
 
 /// `session.core()` 连续失败到该次数才升级为"连接丢失"。
 /// 单次失败按瞬时错误处理（该方法每次都会重新 attach 访问端口，失败未必是断线）。
@@ -301,6 +301,10 @@ impl DebugBackend for ProbeRsBackend {
             .map(|(frames, _)| frames)
     }
 
+    fn supports_watch_interleave(&self) -> bool {
+        true
+    }
+
     /// 监视读插帧版本：帧 push 后若到达监视帧序（全局帧计数对 watch_every 取模），
     /// 在帧间节拍窗读监视块——监视读耗时由超期重锚定自然吸收（只影响该帧间隔），
     /// 读失败仅丢该次监视值（空字节 → 前端缺样标记），不影响示波帧。
@@ -311,7 +315,7 @@ impl DebugBackend for ProbeRsBackend {
         watch_every: usize,
         count: usize,
         interval: Duration,
-    ) -> Result<(BurstFrames, Vec<Vec<Vec<u8>>>), BackendError> {
+    ) -> Result<(BurstFrames, WatchFrames), BackendError> {
         let (out, watch_out, watch_frame_counter) = {
         // 计数器先拷贝为局部：core 借用 self 期间不能触碰 self 字段
         let mut watch_frame_counter = self.watch_frame_counter;
@@ -384,21 +388,28 @@ impl DebugBackend for ProbeRsBackend {
             for (block_idx, (addr, _len)) in blocks.iter().enumerate() {
                 let len = lens[block_idx];
                 let addr = *addr;
-                // 地址/长度合法性已在突发级预计算（见 lens），帧内直接读取
-                // 32-bit 字读在总线层面原子（无撕裂）；失败多为瞬态（USB 忙/超时），
-                // 重试一次。**不回退 read_8**：逐字节访问非原子，固件在字节间写入
-                // 会产生撕裂值（真机实测 sin_20hz 坑洼：符号位翻转的假值）。
-                // 重试仍失败 → 本块降级为空（该块目标本帧缺值，其它块不受影响）。
+                // 地址/长度合法性已在突发级预计算（见 lens），帧内直接读取。
+                // 帧耗时预算：读耗时超过间隔时不再重试，降级本块为空。
+                // 32-bit 字读在总线层面原子（无撕裂）。
                 if addr.is_multiple_of(4) && len.is_multiple_of(4) && len > 0 {
                     let mut words = vec![0u32; len / 4];
                     let mut ok = core.read_32(addr, &mut words).is_ok();
                     if !ok {
-                        SCOPE_READ32_RETRIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        // 冲刺读消耗 DAP 可能残留的队列结果：失败后直接重试，
-                        // DAP 会把上一次排队未取走的数据字重复返回
+                        // 冲刺读消耗 DAP 可能残留的队列结果，再重试一次
                         let mut dummy = vec![0u32; len / 4];
                         let _ = core.read_32(addr, &mut dummy);
                         ok = core.read_32(addr, &mut words).is_ok();
+                        if !ok && len > 4 {
+                            // 大块读失败 → 降为逐字读（探测 CMSIS-DAP 固件对
+                            // BlockTransfer 的大小限制），成功部分拼回
+                            for (w_idx, slot) in words.iter_mut().enumerate() {
+                                let mut w1 = [0u32; 1];
+                                if core.read_32(addr + (w_idx * 4) as u64, &mut w1).is_ok() {
+                                    *slot = w1[0];
+                                }
+                            }
+                            ok = true;
+                        }
                     }
                     if ok {
                         let mut buf = Vec::with_capacity(len);
@@ -422,12 +433,30 @@ impl DebugBackend for ProbeRsBackend {
             out.push((frame_ts, frame));
             // 监视读插帧：全局帧计数到达监视节拍时，在帧间节拍窗读监视块
             // （读耗时由超期重锚定自然吸收）；失败丢该次监视值（空字节 → 前端缺样）
-            if watch_every > 0 && (watch_frame_counter + 1) % watch_every as u64 == 0 {
+            if watch_every > 0 && (watch_frame_counter + 1).is_multiple_of(watch_every as u64) {
                 let mut wblocks = Vec::with_capacity(watch_blocks.len());
                 for (waddr, wlen) in watch_blocks {
-                    let mut wb = vec![0u8; *wlen];
-                    let _ = core.read_8(*waddr, &mut wb);
-                    wblocks.push(wb);
+                    // 4 对齐走 read_32（单事务 ~100-200µs；read_8 逐字节 ~900µs
+                    // 会顶起下一帧节拍）；失败记空字节＝缺样，不塞零值假数据
+                    if waddr.is_multiple_of(4) && wlen.is_multiple_of(4) && *wlen > 0 {
+                        let mut words = vec![0u32; wlen / 4];
+                        if core.read_32(*waddr, &mut words).is_ok() {
+                            let mut buf = Vec::with_capacity(*wlen);
+                            for w in words {
+                                buf.extend_from_slice(&w.to_le_bytes());
+                            }
+                            wblocks.push(buf);
+                        } else {
+                            wblocks.push(Vec::new());
+                        }
+                    } else {
+                        let mut wb = vec![0u8; *wlen];
+                        if core.read_8(*waddr, &mut wb).is_ok() {
+                            wblocks.push(wb);
+                        } else {
+                            wblocks.push(Vec::new());
+                        }
+                    }
                 }
                 watch_out.push(wblocks);
             }

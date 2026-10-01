@@ -441,9 +441,12 @@ fn test_watch_15hz_and_scope_simultaneous_eliminates_12hz_ceiling() {
                 count_10 += 1;
             }
     }
+    // sim 后端用 trait 默认 scope_burst（60ms 阻塞突发），监视采样只能落在
+    // 批间空隙，10Hz 实际周期被量化到 max(100ms, 批界) ≈ 120-133ms。
+    // 下限 5 防饥饿，上限 9 防"仍停留在 15Hz"（15Hz 在 800ms 应约 12 次）
     assert!(
-        (7..=9).contains(&count_10),
-        "10Hz 监视与示波并发在 800ms 内应收到 7~9 次，实得 {count_10} 次"
+        (5..=9).contains(&count_10),
+        "10Hz 监视与示波并发在 800ms 内应收到 5~9 次（sim 批界量化），实得 {count_10} 次"
     );
 
     // 验证切换为 2Hz：在 800ms 内应收到 1~2 次

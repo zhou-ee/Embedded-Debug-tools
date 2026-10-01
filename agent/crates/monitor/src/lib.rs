@@ -295,6 +295,9 @@ struct Engine {
     poll_suppressed: bool,
     /// 监视读插帧激活（watch 目标非空且后端支持）：批间监视采样跳过
     watch_interleave_active: bool,
+    /// 示波连续整批失败次数（自适应退避：2ms 起指数升至 50ms 封顶，
+    /// 成功即清零——固定 50ms 让瞬时 USB 忙也吃满 50ms 空档）
+    scope_fail_streak: u32,
     /// 命中停住后挂起的断点地址（防重复上报）
     held_break_addr: Option<u64>,
     /// 步进用临时断点（停住后清除）
@@ -341,6 +344,7 @@ impl Engine {
             scope_discard_until: None,
             poll_suppressed: false,
             watch_interleave_active: false,
+            scope_fail_streak: 0,
             perf_bursts: 0,
             perf_frames: 0,
             perf_frames_degraded: 0,
@@ -366,7 +370,9 @@ impl Engine {
         }
 
         while !self.shutdown {
-            self.drain_commands();
+            // 预算耗尽（true）＝队列仍有积压：本轮等待上限压到 2ms，命令分批
+            // 与采样交错推进——既不命令独占线程，也不让积压等满整个等待窗
+            let commands_pending = self.drain_commands();
             if self.shutdown {
                 break;
             }
@@ -395,7 +401,13 @@ impl Engine {
                     Some(last) => now.duration_since(last) >= min_cooldown,
                     None => true,
                 };
-                if !self.watch_targets.is_empty() && now >= self.next_watch && cooled_down {
+                // 插帧激活时监视读已在示波突发帧间完成，独立采样跳过（避免同
+                // 一总线双份监视读）；突发失败/后端不支持时回落独立采样
+                if !self.watch_targets.is_empty()
+                    && !self.watch_interleave_active
+                    && now >= self.next_watch
+                    && cooled_down
+                {
                     self.last_watch_sample = Some(now);
                     self.next_watch = if now > self.next_watch + watch_interval {
                         now + watch_interval
@@ -445,11 +457,16 @@ impl Engine {
                 Some(due) => {
                     let now = Instant::now();
                     if due > now {
-                        let remain = (due - now).min(wait_cap);
+                        let cap = if commands_pending {
+                            Duration::from_millis(2)
+                        } else {
+                            wait_cap
+                        };
+                        let remain = (due - now).min(cap);
                         if remain > Duration::from_micros(2500) {
                             std::thread::sleep(remain - Duration::from_micros(1800));
-                        } else if active_sampling {
-                            // 活跃采样（高频示波或监视）最后 <= 2.5ms 忙等到点，彻底杜绝 Windows 毫秒睡眠超期
+                        } else if active_sampling || commands_pending {
+                            // 活跃采样或有命令积压：末段忙等到点，杜绝 Windows 毫秒睡眠超期
                             while Instant::now() < due && !self.shutdown {
                                 std::hint::spin_loop();
                             }
@@ -499,17 +516,26 @@ impl Engine {
         }
     }
 
-    fn drain_commands(&mut self) {
-        loop {
+    /// 每轮命令处理预算：ReadMemSync 等阻塞命令单条可达 2s，无预算时示波激活期
+    /// 的命令洪峰会把采样节拍整体顶空。预算内没处理完的留在队列，返回 true 让
+    /// 主循环不睡眠立即再来一轮（命令与采样交错推进，而非命令独占线程）。
+    fn drain_commands(&mut self) -> bool {
+        const COMMAND_BUDGET: usize = 32;
+        let mut processed = 0usize;
+        while processed < COMMAND_BUDGET {
             match self.cmd_rx.try_recv() {
-                Ok(cmd) => self.handle_command(cmd),
-                Err(TryRecvError::Empty) => break,
+                Ok(cmd) => {
+                    self.handle_command(cmd);
+                    processed += 1;
+                }
+                Err(TryRecvError::Empty) => return false,
                 Err(TryRecvError::Disconnected) => {
                     self.shutdown = true;
-                    break;
+                    return false;
                 }
             }
         }
+        true
     }
 
     fn handle_command(&mut self, cmd: Command) {
@@ -1547,17 +1573,70 @@ impl Engine {
             .div_ceil(interval.as_micros().max(1) as u64))
         .clamp(1, 512) as usize;
 
+        // 监视读插帧参数：仅在示波快于监视且后端真正支持插帧时启用（否则监视
+        // 节拍被示波拖慢或断流，不如独立采样）；目标过滤与 sample_watch 一致
+        // （halted 时仅 auto_refresh）
+        let interleave_capable = self
+            .backend
+            .as_ref()
+            .is_some_and(|b| b.supports_watch_interleave());
+        let halted = self.last_state.unwrap_or(false);
+        let watch_targets: Vec<MemTarget> = self
+            .watch_targets
+            .iter()
+            .filter(|t| halted || t.auto_refresh)
+            .cloned()
+            .collect();
+        let (watch_blocks, watch_pairs, watch_every) = if watch_targets.is_empty()
+            || !interleave_capable
+            || self.scope_freq <= self.watch_freq
+        {
+            (Vec::new(), Vec::new(), 0usize)
+        } else {
+            let pairs: Vec<(u64, u64)> =
+                watch_targets.iter().map(|t| (t.addr, t.size as u64)).collect();
+            let merged = bandwidth::merge_blocks(&pairs, self.watch_freq);
+            let pairs_usize: Vec<(u64, usize)> = merged
+                .iter()
+                .map(|b| (b.start, b.size as usize))
+                .collect();
+            let every = (self.scope_freq / self.watch_freq).round().max(1.0) as usize;
+            (merged, pairs_usize, every)
+        };
+        self.watch_interleave_active = watch_every > 0;
+
         let burst_start = Instant::now();
         let burst_span = interval * count as u32;
         let t0 = self.epoch.elapsed().as_secs_f64();
         // 预热窗内的帧照常执行（维持总线节拍与 Core 预热），但输出丢弃
         let discard_until = self.scope_discard_until;
         let burst_wall_start = Instant::now();
-        let burst_result = self.with_backend(|bk| bk.scope_burst(&blocks, count, interval));
+        let burst_result = self.with_backend(|bk| {
+            bk.scope_burst_watch(&blocks, &watch_pairs, watch_every, count, interval)
+        });
         self.perf_bursts += 1;
         self.perf_burst_wall_us += burst_wall_start.elapsed().as_micros() as u64;
         match burst_result {
-            Some(frames) => {
+            Some((frames, watch_out)) => {
+                // 插帧监视读取每批最后一帧直接推送：监视面板只要最新值，
+                // 时间容差大（≥15Hz 需求 vs 毫秒级误差）
+                if let Some(last) = watch_out.last() {
+                    let mut block_data: Vec<(u64, Vec<u8>)> = Vec::with_capacity(last.len());
+                    for (block, data) in watch_blocks.iter().zip(last) {
+                        block_data.push((block.start, data.clone()));
+                    }
+                    let mut values = HashMap::new();
+                    for t in &watch_targets {
+                        if let Some(bytes) =
+                            extract_from_blocks(&block_data, t.addr, t.size as usize)
+                        {
+                            values.insert(t.id.clone(), bytes);
+                        }
+                    }
+                    if !values.is_empty() {
+                        self.emit(Event::WatchData { values, halted });
+                    }
+                }
                 let all_failed = !frames.is_empty() && frames.iter()
                     .all(|(_, frame)| frame.iter().all(Vec::is_empty));
                 for (offset, frame) in frames {
@@ -1585,21 +1664,35 @@ impl Engine {
                     self.scope_buffer.push(ScopeSample { t, values });
                 }
                 // 一批覆盖 count 拍且批内节拍精确：下一批在 burst_span 之后或立即开始
-                let scheduled = burst_start + burst_span;
-                self.next_scope = if all_failed {
+                if all_failed {
+                    self.scope_fail_streak = self.scope_fail_streak.saturating_add(1);
                     self.on_backend_error(BackendError::Transfer("示波突发全部块读取失败，已记录缺样".into()));
-                    Instant::now() + Duration::from_millis(50)
-                } else if scheduled > Instant::now() {
-                    scheduled
+                    self.next_scope = Instant::now() + Self::fail_backoff(self.scope_fail_streak);
                 } else {
-                    Instant::now()
-                };
+                    self.scope_fail_streak = 0;
+                    let scheduled = burst_start + burst_span;
+                    self.next_scope = if scheduled > Instant::now() {
+                        scheduled
+                    } else {
+                        Instant::now()
+                    };
+                }
             }
             None => {
-                // 读失败时避让 50ms，避免紧凑空转刷爆日志
-                self.next_scope = Instant::now() + Duration::from_millis(50);
+                // 突发整体失败：插帧失效回落独立监视采样；自适应退避（瞬时失败
+                // 2ms 快速重试，连续失败指数升至 50ms 封顶防空转刷日志）
+                self.watch_interleave_active = false;
+                self.scope_fail_streak = self.scope_fail_streak.saturating_add(1);
+                self.next_scope = Instant::now() + Self::fail_backoff(self.scope_fail_streak);
             }
         }
+    }
+
+    /// 整批失败退避：2ms 起，连续失败按 2^n 指数升至 50ms 封顶。
+    /// 固定 50ms 会让瞬时 USB 忙也吃满 50ms 空档（1kHz 下 50 帧缺样）。
+    fn fail_backoff(streak: u32) -> Duration {
+        let ms = 2u64 << (streak.saturating_sub(1)).min(5);
+        Duration::from_millis(ms.min(50))
     }
 
     fn flush_scope(&mut self) {
