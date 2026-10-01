@@ -363,6 +363,16 @@ impl Session {
                     Err(_) => return Err("scope_perf 超时".to_string()),
                 }
             }
+            "set_poll_suppression" => {
+                let enabled = p.get("enabled").and_then(Value::as_bool).ok_or("缺少 enabled")?;
+                let cmd_tx = self
+                    .cmd_slot
+                    .lock()
+                    .clone()
+                    .ok_or("引擎未启动，先调用 connect")?;
+                let _ = cmd_tx.send(Command::SetPollSuppression { enabled });
+                self.send(response_ok(id, Value::Null));
+            }
             "check_bandwidth" => {
                 let targets: Vec<(u64, u64)> = serde_json::from_value(
                     p.get("targets").cloned().ok_or("缺少 targets")?,

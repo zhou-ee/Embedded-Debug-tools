@@ -192,6 +192,24 @@ class AgentService(private val project: Project) : Disposable {
         }
     }
 
+    /**
+     * 调试会话期间挂起引擎状态轮询（停/走由 CLion 调试会话事件即时感知，
+     * 引擎无需每 150-600ms 读一次 DHCSR——那是 1kHz 示波空档的主源之一）。
+     * 非调试场景保持轮询（外部复位/看门狗停机只有探针能看见）。
+     */
+    fun setPollSuppression(enabled: Boolean) {
+        val client = clientRef.get() ?: return
+        ApplicationManager.getApplication().executeOnPooledThread {
+            runCatching {
+                client.requestSync(
+                    "set_poll_suppression",
+                    JsonObject().apply { addProperty("enabled", enabled) },
+                    3000,
+                )
+            }.onFailure { log.warn("set_poll_suppression 失败: $enabled", it) }
+        }
+    }
+
     /** 展开 CLion 求值型节点的第一层子项（LiveWatch 树懒展开用）。 */
     fun computeEvalChildren(value: Any): List<Pair<String, Any>>? =
         ClionEvalBridge.computeChildren(value as com.intellij.xdebugger.frame.XValue)?.map { it.name to (it.value as Any) }
@@ -830,6 +848,7 @@ class AgentService(private val project: Project) : Disposable {
             clionEvalSession = session
             logLine("CLion 原生求值器已就绪（复杂表达式断点期求值可用）")
         }
+        setPollSuppression(true)
         // 监听器挂会话级 Disposable：此前 parent 为工程级 service，会话结束后
         // 注册节点（持有 session 强引用）不注销，反复启停调试会话逐次累积。
         // 会话正常结束时在 sessionStopped 主动 dispose；工程关闭时作为 service

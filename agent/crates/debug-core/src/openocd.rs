@@ -23,6 +23,8 @@ pub struct OpenOcdBackend {
     stream: Option<BufReader<TcpStream>>,
     /// 示波块降级日志限流（1s 一条）
     last_degrade_log: Option<Instant>,
+    /// 示波全局帧计数（跨突发持续，监视插帧节拍用）
+    watch_frame_counter: u64,
     /// Windows 专属：kill-on-close Job Object，agent 崩溃时内核自动收割 openocd
     #[cfg(windows)]
     job: Option<crate::openocd_job::Job>,
@@ -44,6 +46,7 @@ impl OpenOcdBackend {
             tcl_port: TCL_PORT,
             child: None,
             stream: None,
+            watch_frame_counter: 0,
             last_degrade_log: None,
             #[cfg(windows)]
             job: None,
@@ -517,8 +520,23 @@ impl DebugBackend for OpenOcdBackend {
         count: usize,
         interval: Duration,
     ) -> Result<BurstFrames, BackendError> {
+        self.scope_burst_watch(blocks, &[], 0, count, interval)
+            .map(|(frames, _)| frames)
+    }
+
+    /// 监视读插帧版本（openocd 路径）：帧 push 后若到达监视帧序，在帧间节拍窗
+    /// 以 Tcl 命令读监视块；读失败仅丢该次监视值（空字节 → 前端缺样标记）。
+    fn scope_burst_watch(
+        &mut self,
+        blocks: &[(u64, usize)],
+        watch_blocks: &[(u64, usize)],
+        watch_every: usize,
+        count: usize,
+        interval: Duration,
+    ) -> Result<(BurstFrames, Vec<Vec<Vec<u8>>>), BackendError> {
         let start = Instant::now();
         let mut out = Vec::with_capacity(count);
+        let mut watch_out: Vec<Vec<Vec<u8>>> = Vec::new();
         let mut total_blocks = 0usize;
         let mut degraded = 0usize;
         // 帧节拍：读耗时超过间隔时，截止时刻重锚到"当前 + 间隔"，不追赶旧截止
@@ -603,6 +621,25 @@ impl DebugBackend for OpenOcdBackend {
                 frame.push(bytes);
             }
             out.push((frame_ts, frame));
+            // 监视读插帧：全局帧计数到达监视节拍时读监视块（读失败丢该次监视值）
+            if watch_every > 0 && (self.watch_frame_counter + 1) % watch_every as u64 == 0 {
+                let mut wblocks = Vec::with_capacity(watch_blocks.len());
+                for (waddr, wlen) in watch_blocks {
+                    let resp = self.tcl(&format!("read_memory 0x{waddr:x} 32 {}", wlen / 4))?;
+                    let u32s = parse_u32_tokens(&resp);
+                    let mut bytes = Vec::with_capacity(*wlen);
+                    for w in u32s {
+                        bytes.extend_from_slice(&w.to_le_bytes());
+                    }
+                    if bytes.len() == *wlen {
+                        wblocks.push(bytes);
+                    } else {
+                        wblocks.push(Vec::new());
+                    }
+                }
+                watch_out.push(wblocks);
+            }
+            self.watch_frame_counter += 1;
             // 节拍推进与重锚定语义同 probe-rs 后端（见彼处注释）
             due += interval;
             let now = Instant::now();
@@ -618,7 +655,7 @@ impl DebugBackend for OpenOcdBackend {
                 eprintln!("[openocd] scope 突发降级：{degraded}/{total_blocks} 块读取失败（该块目标本帧缺值，其它块不受影响）");
             }
         }
-        Ok(out)
+        Ok((out, watch_out))
     }
 }
 

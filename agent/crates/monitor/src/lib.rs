@@ -97,6 +97,8 @@ pub enum Command {
     RequestRegsAndStack,
     /// 示波分段耗时诊断（scope_perf 协议暴露）
     ScopePerf { reply: Sender<Result<serde_json::Value, String>> },
+    /// 调试会话期间挂起状态轮询（停/走由 CLion 调试会话事件即时感知）
+    SetPollSuppression { enabled: bool },
     Shutdown,
 }
 
@@ -289,6 +291,8 @@ struct Engine {
     /// （第二帧仍异常：不同地址返回相同值/符号位翻转假值），按时间窗丢弃
     /// 与采样率无关
     scope_discard_until: Option<Instant>,
+    /// 调试会话期间挂起状态轮询（set_poll_suppression 设置）
+    poll_suppressed: bool,
     /// 命中停住后挂起的断点地址（防重复上报）
     held_break_addr: Option<u64>,
     /// 步进用临时断点（停住后清除）
@@ -333,6 +337,7 @@ impl Engine {
             next_scope_flush: now,
             scope_blocks: Vec::new(),
             scope_discard_until: None,
+            poll_suppressed: false,
             perf_bursts: 0,
             perf_frames: 0,
             perf_frames_degraded: 0,
@@ -410,7 +415,9 @@ impl Engine {
                         STATE_POLL_INTERVAL
                     };
                     self.next_state_poll = now + poll_interval;
-                    self.poll_state();
+                    if !self.poll_suppressed {
+                            self.poll_state();
+                        }
                 }
 
                 // 3. 示波采样：无漂移节拍突发连读
@@ -686,6 +693,9 @@ impl Engine {
             }
             Command::RequestRegsAndStack => {
                 self.send_regs_and_stack();
+            }
+            Command::SetPollSuppression { enabled } => {
+                self.poll_suppressed = enabled;
             }
             Command::ScopePerf { reply } => {
                 let v = serde_json::json!({
@@ -1559,14 +1569,46 @@ impl Engine {
         let burst_start = Instant::now();
         let burst_span = interval * count as u32;
         let t0 = self.epoch.elapsed().as_secs_f64();
+        // 监视读插帧：监视目标存在时，把监视块与触发帧序交给 scope_burst，
+        // 在帧间节拍窗读监视（用户指定设计：监视读塞进示波帧间空闲窗，
+        // 不独立占用总线造成空档）。监视节拍 = watch_interval / scope_interval 帧。
+        let watch_blocks: Vec<(u64, usize)> = self
+            .watch_targets
+            .iter()
+            .map(|t| (t.addr, t.size as usize))
+            .collect();
+        let watch_every = if watch_blocks.is_empty() {
+            0
+        } else {
+            let watch_interval =
+                Duration::from_secs_f64(1.0 / self.watch_freq.max(1.0));
+            ((watch_interval.as_micros() as f64) / (interval.as_micros() as f64))
+                .round()
+                .max(1.0) as usize
+        };
         // 预热窗内的帧照常执行（维持总线节拍与 Core 预热），但输出丢弃
         let discard_until = self.scope_discard_until;
         let burst_wall_start = Instant::now();
-        let burst_result = self.with_backend(|bk| bk.scope_burst(&blocks, count, interval));
+        let burst_result = self.with_backend(|bk| {
+            bk.scope_burst_watch(&blocks, &watch_blocks, watch_every, count, interval)
+        });
         self.perf_bursts += 1;
         self.perf_burst_wall_us += burst_wall_start.elapsed().as_micros() as u64;
         match burst_result {
-            Some(frames) => {
+            Some((frames, watch_frames)) => {
+                // 监视插帧结果 → WatchData 事件（values 以 MemTarget.id 为键）
+                for wblocks in &watch_frames {
+                    if wblocks.is_empty() {
+                        continue;
+                    }
+                    let mut values = HashMap::with_capacity(self.watch_targets.len());
+                    for (target, bytes) in self.watch_targets.iter().zip(wblocks) {
+                        values.insert(target.id.clone(), bytes.clone());
+                    }
+                    if !values.is_empty() {
+                        self.emit(Event::WatchData { values, halted: false });
+                    }
+                }
                 let all_failed = !frames.is_empty() && frames.iter()
                     .all(|(_, frame)| frame.iter().all(Vec::is_empty));
                 for (offset, frame) in frames {
