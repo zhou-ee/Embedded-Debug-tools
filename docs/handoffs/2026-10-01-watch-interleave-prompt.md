@@ -52,3 +52,41 @@
   Engine sample_scope 接线（watch_every = watch_interval/scope_interval，监视字节按
   WatchData 事件解码，values 以 MemTarget.id 为键）；调试期轮询挂起
   （set_poll_suppression 协议命令 + 插件在 attachDebugSession/disconnect 时设置）。
+
+## 下一工作段设计（2026-10-01 用户确认：维护操作分摊到帧间窗口）
+
+用户反馈：200Hz 下硬件时间充足（5ms/帧，读 ~0.3ms）仍有空档——根因是 watch/poll/flush
+堆叠在批间执行。设计：**所有维护操作成为示波突发内部的帧间操作，每帧窗口最多一个**。
+
+### Backend trait 改造
+scope_burst_watch 签名改为返回结构体并增加 poll_every：
+```rust
+pub struct BurstOutput {
+    pub frames: BurstFrames,
+    pub watch: Vec<Vec<Vec<u8>>>,     // 帧序 → 各监视块字节（仅监视触发的帧有值）
+    pub halted_seen: Option<bool>,    // 突发内最后一次 is_halted 结果（None=未轮询）
+}
+fn scope_burst_watch(&mut self, blocks, watch_blocks, watch_every, poll_every,
+                     count, interval) -> Result<BurstOutput, BackendError>;
+```
+帧循环内 push 后的维护调度（每窗口至多一个操作）：
+```rust
+let want_watch = watch_every > 0 && (counter + 1) % watch_every as u64 == 0;
+let want_poll = poll_every > 0 && (counter + 1) % poll_every as u64 == 0 && !want_watch;
+// want_watch: 读监视块 → watch.push；want_poll: is_halted() 记录 halted_seen
+// 读耗时超窗 → 超期重锚定自然吸收（单帧延迟，不积累）
+```
+- probe-rs：is_halted = core.is_halted()；openocd：tcl("poll") 解析（is_halted 已封装）。
+- scope_burst 保留为委托包装（watch_blocks 空 + poll_every 0）。
+
+### Engine 接线
+- poll_every = poll_suppressed ? 0 : (600ms / interval)（示波激活期；非示波保持批间 150ms poll）。
+- watch_every = watch_interval / interval（既有逻辑）。
+- 突发结束后：halted_seen 与 last_state 比较，变化则 emit State 事件 +
+  触发既有停机上报流程；watch 帧数据解码为 WatchData（既有代码）。
+- 外层循环：scope 激活期跳过批间 poll_state（改由突发内 poll_every 承担）与
+  sample_watch（改由插帧承担）；非激活期行为不变。
+
+### 验收
+200Hz 与 1kHz、watch 15Hz：>3 周期空档数 ≤ 无维护基线；监视值照常更新；
+停机/恢复事件不丢失。cargo 58+ / gradle 145+ 回归。
