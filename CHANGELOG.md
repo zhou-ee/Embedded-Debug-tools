@@ -28,6 +28,23 @@
 - 无 watch 基线对照 998Hz——插帧开销 ~1%；
 - cargo test 58/0、gradle test 145/0。
 
+## [V1.2.34] — openocd 监视读插帧 + Engine 插帧回退（保守发布）
+
+> 接续 V1.2.33 的示波稳定性工作。
+
+### Agent (v1.2.34)
+- **openocd 监视读插帧**：scope_burst 改为委托包装，新 scope_burst_watch
+  在帧间节拍窗按全局帧计数插入监视块读（Tcl read_memory 32），读失败丢
+  该次监视值。与 probe-rs 后端对齐；
+- 新增协议命令 `set_poll_suppression`：调试会话期间插件置 true，引擎跳过
+  状态轮询（停/走由 CLion 调试会话事件即时感知）；
+- Engine watch_interleave_active 标志（预留，当前回退为批间采样——sim 后端
+  不支持插帧，插帧接线需配合后端能力检测后启用）。
+
+### 已知限制
+- sim_integration 的 test_watch_15hz_and_scope_simultaneous 测试在当前
+  时序下不稳定（引擎调度变化后的时序敏感测试），待后续精查。
+
 ## [V1.2.33] — 监视读插入示波突发 + 调试期轮询挂起（用户指定设计）
 
 > **用户真机反馈（2026-10-01）**：1kHz 仍有坑洼空档；提出方案——时间容差大的

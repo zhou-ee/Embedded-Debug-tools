@@ -396,38 +396,22 @@ impl Engine {
                     None => true,
                 };
                 if !self.watch_targets.is_empty() && now >= self.next_watch && cooled_down {
-                    // 监视读插帧激活时跳过批间监视采样（避免双重采样与批间空档）
-                    if !self.watch_interleave_active {
-                        self.last_watch_sample = Some(now);
-                        self.next_watch = if now > self.next_watch + watch_interval {
-                            now + watch_interval
-                        } else {
-                            self.next_watch + watch_interval
-                        };
-                        self.sample_watch();
+                    self.last_watch_sample = Some(now);
+                    self.next_watch = if now > self.next_watch + watch_interval {
+                        now + watch_interval
                     } else {
-                        // 仅推进节拍（实际读取在示波突发内完成）
-                        self.last_watch_sample = Some(now);
-                        self.next_watch += watch_interval;
-                    }
+                        self.next_watch + watch_interval
+                    };
+                    self.sample_watch();
                 }
 
                 // 2. 状态轮询（10Hz）：及时探测目标 halt/running 与断点命中
                 let now = Instant::now();
                 if now >= self.next_state_poll {
-                    // 示波激活时状态轮询降频（150→600ms）：poll 的 PPB/DHCSR
-                    // 读取落在帧间会造成 1-3ms 级空档（1kHz 下 >3ms 即标记空档，
-                    // 真机实测 ~每 350ms 一次与轮询周期吻合）。调试器引发的停机
-                    // 由插件的调试会话监听即时感知，不依赖此轮询。
-                    let poll_interval = if scope_active {
-                        Duration::from_millis(600)
-                    } else {
-                        STATE_POLL_INTERVAL
-                    };
-                    self.next_state_poll = now + poll_interval;
+                    self.next_state_poll = now + STATE_POLL_INTERVAL;
                     if !self.poll_suppressed {
-                            self.poll_state();
-                        }
+                        self.poll_state();
+                    }
                 }
 
                 // 3. 示波采样：无漂移节拍突发连读
@@ -1566,47 +1550,14 @@ impl Engine {
         let burst_start = Instant::now();
         let burst_span = interval * count as u32;
         let t0 = self.epoch.elapsed().as_secs_f64();
-        // 监视读插帧：监视目标存在时，把监视块与触发帧序交给 scope_burst，
-        // 在帧间节拍窗读监视（用户指定设计：监视读塞进示波帧间空闲窗，
-        // 不独立占用总线造成空档）。监视节拍 = watch_interval / scope_interval 帧。
-        let watch_blocks: Vec<(u64, usize)> = self
-            .watch_targets
-            .iter()
-            .map(|t| (t.addr, t.size as usize))
-            .collect();
-        self.watch_interleave_active = !watch_blocks.is_empty();
-        let watch_every = if watch_blocks.is_empty() {
-            0
-        } else {
-            let watch_interval =
-                Duration::from_secs_f64(1.0 / self.watch_freq.max(1.0));
-            ((watch_interval.as_micros() as f64) / (interval.as_micros() as f64))
-                .round()
-                .max(1.0) as usize
-        };
         // 预热窗内的帧照常执行（维持总线节拍与 Core 预热），但输出丢弃
         let discard_until = self.scope_discard_until;
         let burst_wall_start = Instant::now();
-        let burst_result = self.with_backend(|bk| {
-            bk.scope_burst_watch(&blocks, &watch_blocks, watch_every, count, interval)
-        });
+        let burst_result = self.with_backend(|bk| bk.scope_burst(&blocks, count, interval));
         self.perf_bursts += 1;
         self.perf_burst_wall_us += burst_wall_start.elapsed().as_micros() as u64;
         match burst_result {
-            Some((frames, watch_frames)) => {
-                // 监视插帧结果 → WatchData 事件（values 以 MemTarget.id 为键）
-                for wblocks in &watch_frames {
-                    if wblocks.is_empty() {
-                        continue;
-                    }
-                    let mut values = HashMap::with_capacity(self.watch_targets.len());
-                    for (target, bytes) in self.watch_targets.iter().zip(wblocks) {
-                        values.insert(target.id.clone(), bytes.clone());
-                    }
-                    if !values.is_empty() {
-                        self.emit(Event::WatchData { values, halted: false });
-                    }
-                }
+            Some(frames) => {
                 let all_failed = !frames.is_empty() && frames.iter()
                     .all(|(_, frame)| frame.iter().all(Vec::is_empty));
                 for (offset, frame) in frames {
