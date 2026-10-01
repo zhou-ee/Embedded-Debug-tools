@@ -293,6 +293,8 @@ struct Engine {
     scope_discard_until: Option<Instant>,
     /// 调试会话期间挂起状态轮询（set_poll_suppression 设置）
     poll_suppressed: bool,
+    /// 监视读插帧激活（watch 目标非空且后端支持）：批间监视采样跳过
+    watch_interleave_active: bool,
     /// 命中停住后挂起的断点地址（防重复上报）
     held_break_addr: Option<u64>,
     /// 步进用临时断点（停住后清除）
@@ -338,6 +340,7 @@ impl Engine {
             scope_blocks: Vec::new(),
             scope_discard_until: None,
             poll_suppressed: false,
+            watch_interleave_active: false,
             perf_bursts: 0,
             perf_frames: 0,
             perf_frames_degraded: 0,
@@ -393,13 +396,20 @@ impl Engine {
                     None => true,
                 };
                 if !self.watch_targets.is_empty() && now >= self.next_watch && cooled_down {
-                    self.last_watch_sample = Some(now);
-                    self.next_watch = if now > self.next_watch + watch_interval {
-                        now + watch_interval
+                    // 监视读插帧激活时跳过批间监视采样（避免双重采样与批间空档）
+                    if !self.watch_interleave_active {
+                        self.last_watch_sample = Some(now);
+                        self.next_watch = if now > self.next_watch + watch_interval {
+                            now + watch_interval
+                        } else {
+                            self.next_watch + watch_interval
+                        };
+                        self.sample_watch();
                     } else {
-                        self.next_watch + watch_interval
-                    };
-                    self.sample_watch();
+                        // 仅推进节拍（实际读取在示波突发内完成）
+                        self.last_watch_sample = Some(now);
+                        self.next_watch += watch_interval;
+                    }
                 }
 
                 // 2. 状态轮询（10Hz）：及时探测目标 halt/running 与断点命中
@@ -1543,23 +1553,10 @@ impl Engine {
         //   960–1000Hz；早期文档写的"~870Hz 架构上限"出自 bench 推算，
         //   与实测不符，已作废。
         // 时间戳一律取实际读时刻，无时间轴失真。
-        // 批量时长：当同时开启高频监视（>=10Hz）时，将突发窗口从 40ms 降至 20ms；
-        // 且若下一次变量监视即将在本次突发内到期，进一步将突发时长裁剪至剩余时间，
-        // 确保变量监视准时在批间切入，杜绝 15Hz 监视被 40ms 示波突发阻塞死锁在 ~12Hz。
-        let mut burst_target_us = if !self.watch_targets.is_empty() && self.watch_freq >= 10.0 {
-            20_000u64
-        } else {
-            40_000u64
-        };
-        if !self.watch_targets.is_empty() {
-            let now = Instant::now();
-            if self.next_watch > now {
-                let time_to_watch = (self.next_watch - now).as_micros() as u64;
-                if time_to_watch < burst_target_us {
-                    burst_target_us = time_to_watch.max(interval.as_micros() as u64);
-                }
-            }
-        }
+        // 批量时长 60ms：监视读已在突发内部按帧插帧（scope_burst_watch），
+        // 批间切入约束消失——拉长突发摊薄边界开销（core 重获取 ~1.4ms/次），
+        // 边界空档频率从 每 40ms 一次 降到 每 60ms 一次
+        let burst_target_us = 60_000u64;
         // 帧数上限 48→512：高频（≥2kHz）时 48 帧（16ms@3kHz）批间开销占比过高
         // （3kHz 实测仅 ~911Hz），放大突发长度摊薄批间成本；低频不受影响
         let count = (burst_target_us
@@ -1577,6 +1574,7 @@ impl Engine {
             .iter()
             .map(|t| (t.addr, t.size as usize))
             .collect();
+        self.watch_interleave_active = !watch_blocks.is_empty();
         let watch_every = if watch_blocks.is_empty() {
             0
         } else {
