@@ -39,6 +39,31 @@ object ScopeSamples {
             previous.value else next.value
     }
 
+    /**
+     * 缺样/空档"维持原值"遍历（stair-step）：NaN 与缺口区间以前一个有效值平延续，
+     * 直到下一个有效采样（用户指定的渲染语义：缺样不断开，保持原值）。
+     * emit(时间秒, 绘制值)——绘制值可能是维持的前值而非本样本原始值。
+     */
+    fun forEachHeld(series: List<ScopeSample>, start: Int, end: Int, emit: (Double, Float) -> Unit) {
+        var lastFinite: Float? = null
+        for (i in start until end) {
+            val s = series[i]
+            val tSec = s.timestampNanos / 1e9
+            val v = s.value
+            if (v.isFinite()) {
+                if (lastFinite != null && s.gapBefore) {
+                    // 空档：前值平延续到本采样时刻（维持原值直到下一次采样）
+                    emit(tSec, lastFinite)
+                }
+                emit(tSec, v)
+                lastFinite = v
+            } else if (lastFinite != null) {
+                // NaN 缺样：维持前值
+                emit(tSec, lastFinite)
+            }
+        }
+    }
+
     /** 分段发生在降采样之前，避免同一像素桶跨越缺口连接极值。 */
     fun forEachRun(series: List<ScopeSample>, start: Int, end: Int, emit: (Int, Int) -> Unit) {
         var runStart = -1

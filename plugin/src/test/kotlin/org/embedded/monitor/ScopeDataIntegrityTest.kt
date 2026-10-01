@@ -77,7 +77,8 @@ class ScopeDataIntegrityTest {
     }
 
     @Test
-    fun denseRenderingDoesNotBridgeGapInsideOneM4Bucket() {
+    fun denseRenderingHoldsLastValueAcrossGap() {
+        // V1.2.31 用户指定语义：缺样/空档不再断开，前值平延续到下一个有效采样
         for (missing in listOf(false, true)) {
             val samples = (0..612).map { ScopeSample(it * period, 1f) }.toMutableList()
             if (missing) samples.add(ScopeSample(613 * period, Float.NaN))
@@ -93,7 +94,8 @@ class ScopeDataIntegrityTest {
                 draw.isAccessible = true
                 draw.invoke(panel, graphics, samples, 0.0, 1.5, 20, 100, false, variable, xOf, yOf)
                 assertTrue("curve must be drawn", image.getRGB(400, 20) ushr 24 != 0)
-                assertEquals("gap must stay blank when missing=$missing", 0, image.getRGB(700, 20) ushr 24)
+                // 空档区间维持前值（y=20 处连续有像素），不再留白
+                assertEquals("gap must hold last value when missing=$missing", 255, image.getRGB(700, 20) ushr 24)
                 assertTrue("curve must resume after gap", image.getRGB(1000, 20) ushr 24 != 0)
             } finally {
                 graphics.dispose()

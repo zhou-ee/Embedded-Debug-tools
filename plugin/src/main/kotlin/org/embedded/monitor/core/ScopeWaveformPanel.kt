@@ -877,36 +877,34 @@ class ScopeWaveformPanel : JPanel() {
         if (!dark) baseColor = baseColor.darker()
 
         val path = Path2D.Float()
-        // 先按缺样、实际时间空档分段，再在段内保留入口、极值、出口。
-        // 缺口即使落在同一个降采样桶内，也不能被直线跨过去。
-        ScopeSamples.forEachRun(series, actualStart, actualEnd) { runStart, runEnd ->
-            var first = true
-            fun emit(index: Int) {
-                val sample = series[index]
-                val x = xOf(sample.timestampNanos / 1e9)
-                val y = yOf(sample.value.toDouble()).coerceIn(-5000.0, plotH + 5000.0)
-                if (first) {
-                    path.moveTo(x, y)
-                    first = false
-                } else {
-                    path.lineTo(x, y)
+        // 缺样/空档"维持原值"渲染（用户指定语义）：NaN 与缺口区间以前值平延续到
+        // 下一个有效采样，不断开。先物化 (时间, 绘制值) 点列，再沿用包络降采样
+        // （入口/极值/出口），极值比较基于维持后的绘制值。
+        val ptsT = ArrayList<Double>(n)
+        val ptsV = ArrayList<Float>(n)
+        ScopeSamples.forEachHeld(series, actualStart, actualEnd) { tSec, v ->
+            ptsT.add(tSec); ptsV.add(v)
+        }
+        var first = true
+        fun emitPt(tt: Double, vv: Float) {
+            val x = xOf(tt)
+            val y = yOf(vv.toDouble()).coerceIn(-5000.0, plotH + 5000.0)
+            if (first) { path.moveTo(x, y); first = false } else path.lineTo(x, y)
+        }
+        if (step <= 1) {
+            for (i in ptsT.indices) emitPt(ptsT[i], ptsV[i])
+        } else {
+            var i = 0
+            while (i < ptsV.size) {
+                val blockEnd = min(ptsV.size, i + step)
+                var minIdx = i
+                var maxIdx = i
+                for (j in i + 1 until blockEnd) {
+                    if (ptsV[j] < ptsV[minIdx]) minIdx = j
+                    if (ptsV[j] > ptsV[maxIdx]) maxIdx = j
                 }
-            }
-            if (step <= 1) {
-                for (i in runStart until runEnd) emit(i)
-            } else {
-                var i = runStart
-                while (i < runEnd) {
-                    val blockEnd = min(runEnd, i + step)
-                    var minIdx = i
-                    var maxIdx = i
-                    for (j in i + 1 until blockEnd) {
-                        if (series[j].value < series[minIdx].value) minIdx = j
-                        if (series[j].value > series[maxIdx].value) maxIdx = j
-                    }
-                    listOf(i, minIdx, maxIdx, blockEnd - 1).distinct().sorted().forEach(::emit)
-                    i = blockEnd
-                }
+                listOf(i, minIdx, maxIdx, blockEnd - 1).distinct().sorted().forEach { emitPt(ptsT[it], ptsV[it]) }
+                i = blockEnd
             }
         }
 
