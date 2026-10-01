@@ -76,6 +76,21 @@ pub trait DebugBackend: Send {
 
     fn read_core_register(&mut self, name: &str) -> Result<u64, BackendError>;
 
+    /// 示波突发 + 监视读插帧：在帧间节拍窗内按 watch_every 帧间隔插入监视块读
+    /// （监视节拍要求低、时间容差大，塞进示波帧间空闲窗避免独立占用总线造成空档）。
+    /// 返回 (示波帧, 监视帧数据[帧序 → 各监视块字节])。默认不插帧（Sim 等回退）。
+    fn scope_burst_watch(
+        &mut self,
+        blocks: &[(u64, usize)],
+        _watch_blocks: &[(u64, usize)],
+        _watch_every: usize,
+        count: usize,
+        interval: Duration,
+    ) -> Result<(BurstFrames, Vec<Vec<Vec<u8>>>), BackendError> {
+        let frames = self.scope_burst(blocks, count, interval)?;
+        Ok((frames, Vec::new()))
+    }
+
     /// 示波突发采样：以 interval 为节拍连读 count 帧（节拍由实现内部精确
     /// 控制，probe-rs 覆盖后单帧的 Core 重建开销被摊薄）。返回每帧相对突发
     /// 起始时刻的偏移与数据（块顺序与 blocks 一致）。

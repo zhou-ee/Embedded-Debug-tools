@@ -28,3 +28,15 @@
 ## 验收
 1kHz + 15Hz watch：示波空档数不高于无 watch 基线；监视值正常更新；
 调试会话中（GDB attached）engine 无 poll 引发的空档。
+
+
+## 进度（2026-10-01 第二段）
+- ✅ trait `scope_burst_watch` 已加入 debug-core/src/lib.rs（默认实现 = 回退 scope_burst 不插帧，
+  Sim/未实现的调用方零影响），probe-rs/openocd **尚未实现**（当前走默认回退=现行为）。
+- 实现方式（下一工作段执行）：把两后端 scope_burst 的函数体改造为 scope_burst_watch
+  （签名加 watch_blocks/watch_every，帧 push 后按 `(i+1) % watch_every == 0` 插入监视块读，
+  读失败仅丢该次监视值；监视读耗时由既有超期重锚定自然吸收），scope_burst 保留为
+  委托包装（`self.scope_burst_watch(blocks, &[], 0, ...)`）以不破坏测试/示例。
+- Engine 侧接线：sample_scope 计算 watch_every = watch_interval/interval；监视字节
+  按 WatchData 事件（values 以 MemTarget.id 为键）解码发送，推进 next_watch。
+- 回归基线：cargo 58/0、gradle 145/0。
