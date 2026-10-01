@@ -3,6 +3,28 @@
 > **路径映射说明**：V1.2.x 历史条目中的 `software_ref/` 对应本仓库现在的 `agent/`，
 > `package_release.py` 对应 `package.py`（项目在开源重构前为 software_ref 单体工程）。
 
+## [V1.2.32] — 示波节拍根治：混合粗睡+忙等、区域校准提升到突发级
+
+> **真机量化定位**（裸协议基准 + scope_perf 分段计数器）：OpenOCD 裸 Tcl 单命令
+> 仅 165µs（天花板 6060Hz）、probe-rs 单读 4B 101µs——瓶颈不在探针硬件，而在
+> agent 采样节拍的 Windows 粒度与每帧重复校验。
+
+### Agent (v1.2.32)
+- **混合节拍**（粗睡到临近 + 末段忙等，同引擎外层循环策略）：scope_burst 批内
+  此前用纯 thread::sleep——Windows 粒度 ~1-2ms 使亚毫秒间隔（3kHz=333µs）退化为
+  ~1ms（3kHz 只能跑 ~900Hz）。改为粗睡+忙等后：**3kHz 单通道 2713Hz、三通道
+  2282Hz**（接近历史 2800Hz），1kHz 三通道 937Hz；
+- **区域校验提升到突发级**：scope_burst 此前每帧每块调用 memory_regions()（每次
+  构造区域表，~1ms/块）——提升到突发级一次预计算后 3kHz 三通道 818→2282Hz；
+- 帧内残留的旧区域校验代码清除；块大小扫描证实 4B~128B 全尺寸无 NoAcknowledge
+  （此前 dap_bench 的 NoAck 为会话异常中断后的脏状态瞬态，非块大小缺陷）。
+
+### 真机验证（STM32G431CBTx + Flash Pro，4MHz SWD）
+- probe-rs：1kHz 三通道 **937Hz**（p50=1.00ms）、3kHz 单通道 **2713Hz**（p50=0.33ms）、
+  3kHz 三通道 **2282Hz**；openocd：3kHz 三通道 **1932Hz**（p50=0.33ms）、
+  1kHz 三通道 923Hz；
+- cargo test 58/0、clippy 零告警。
+
 ## [V1.2.31] — 修复采样频率回退（节拍重锚定条件）
 
 ### Plugin (v1.2.31)

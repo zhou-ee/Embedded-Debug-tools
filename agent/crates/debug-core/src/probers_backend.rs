@@ -298,82 +298,84 @@ impl DebugBackend for ProbeRsBackend {
         let mut out = Vec::with_capacity(count);
         // 帧节拍：读耗时超过间隔时，截止时刻重锚到"当前 + 间隔"，不追赶旧截止——
         // 旧实现超期后沿用旧截止连续快速读取，批内间隔忽快忽慢
+        // 区域校验提升到突发级一次预计算：memory_regions() 每次调用会构造区域表，
+        // 放在每帧每块里以 ~1ms/块 的开销拖垮采样节拍（真机实测 4 通道仅 443Hz）
+        let lens: Vec<usize> = blocks
+            .iter()
+            .map(|(addr, len)| {
+                match core.memory_regions().find(|r| r.contains(*addr)) {
+                    Some(r) => {
+                        let avail = (r.address_range().end - addr) as usize;
+                        if avail < *len {
+                            return Err(BackendError::Transfer(format!(
+                                "采样范围 0x{addr:08x}+{len}B 越出区域末尾（仅剩 {avail}B），已拒绝下发"
+                            )));
+                        }
+                        Ok(*len)
+                    }
+                    None if (PPB_LO..PPB_HI).contains(addr)
+                        || (PERIPH_LO..PERIPH_HI).contains(addr)
+                        || (EXT_RAM_LO..EXT_RAM_HI).contains(addr) =>
+                    {
+                        let hi = if (PPB_LO..PPB_HI).contains(addr) {
+                            PPB_HI
+                        } else if (PERIPH_LO..PERIPH_HI).contains(addr) {
+                            PERIPH_HI
+                        } else {
+                            EXT_RAM_HI
+                        };
+                        let avail = (hi - addr) as usize;
+                        if avail < *len {
+                            return Err(BackendError::Transfer(format!(
+                                "采样范围 0x{addr:08x}+{len}B 越出白名单区末尾（仅剩 {avail}B），已拒绝下发"
+                            )));
+                        }
+                        Ok(*len)
+                    }
+                    None => Err(BackendError::Transfer(format!(
+                        "采样地址 0x{addr:08x} 不在任何已映射内存区域内，已拒绝下发"
+                    ))),
+                }
+            })
+            .collect::<Result<Vec<_>, BackendError>>()?;
         let mut due = start;
         for _i in 0..count {
-            if Instant::now() < due {
-                std::thread::sleep(due - Instant::now());
+            // 混合节拍（同引擎外层循环）：粗睡到临近 + 末段忙等——
+            // Windows thread::sleep 粒度 ~1-2ms，纯 sleep 无法覆盖亚毫秒间隔
+            // （3kHz=333µs/帧在纯 sleep 下退化为 ~1ms → 只有 ~900Hz）
+            let now = Instant::now();
+            if now < due {
+                let remain = due - now;
+                if remain > Duration::from_millis(2) {
+                    std::thread::sleep(remain - Duration::from_micros(1500));
+                }
+                while Instant::now() < due {
+                    std::hint::spin_loop();
+                }
             }
             // 帧时间戳 = 本帧读取开始时刻（样本窗口起点）。旧实现取全部块读完
             // 后的时刻，回包等待与调度延迟被混进时间戳（真机实测：Agent 时间戳
             // 间隔与 MCU tick 间隔严重错位 56ms/6ms）
             let frame_ts = start.elapsed();
             let mut frame = Vec::with_capacity(blocks.len());
-            for (addr, len) in blocks {
-                // 同 read_bytes：地址不在任何区域内就**不要下发**，
-                // 否则会让访问端口进故障态（示波目标地址配错时尤其致命）
-                let len = match core.memory_regions().find(|r| r.contains(*addr)) {
-                    Some(r) => {
-                        let avail = (r.address_range().end - addr) as usize;
-                        if avail < *len {
-                            // 与 read_bytes 的显式报错策略一致：静默截断会让
-                            // extract_from_blocks 因数据不足把该目标从所有样本
-                            // 中静默丢弃（示波目标贴 RAM 顶端时正是配错地址，
-                            // 最需要报错的场景）
-                            return Err(BackendError::Transfer(format!(
-                                "采样范围 0x{addr:08x}+{len}B 越出区域末尾（仅剩 {avail}B），已拒绝下发"
-                            )));
-                        }
-                        *len
-                    }
-                    // 白名单区同样做末端校验（与 read_bytes 策略一致）：跨出上界
-                    // 会让访问端口进故障态，宁可显式报错走避让
-                    None if (PPB_LO..PPB_HI).contains(addr) => {
-                        let avail = (PPB_HI - addr) as usize;
-                        if avail < *len {
-                            return Err(BackendError::Transfer(format!(
-                                "采样范围 0x{addr:08x}+{len}B 越出 PPB 区末尾（仅剩 {avail}B），已拒绝下发"
-                            )));
-                        }
-                        *len
-                    }
-                    None if (PERIPH_LO..PERIPH_HI).contains(addr) => {
-                        let avail = (PERIPH_HI - addr) as usize;
-                        if avail < *len {
-                            return Err(BackendError::Transfer(format!(
-                                "采样范围 0x{addr:08x}+{len}B 越出外设区末尾（仅剩 {avail}B），已拒绝下发"
-                            )));
-                        }
-                        *len
-                    }
-                    None if (EXT_RAM_LO..EXT_RAM_HI).contains(addr) => {
-                        let avail = (EXT_RAM_HI - addr) as usize;
-                        if avail < *len {
-                            return Err(BackendError::Transfer(format!(
-                                "采样范围 0x{addr:08x}+{len}B 越出外扩 RAM 末尾（仅剩 {avail}B），已拒绝下发"
-                            )));
-                        }
-                        *len
-                    }
-                    None => {
-                        return Err(BackendError::Transfer(format!(
-                            "采样地址 0x{addr:08x} 不在任何已映射内存区域内，已拒绝下发"
-                        )))
-                    }
-                };
+            for (block_idx, (addr, _len)) in blocks.iter().enumerate() {
+                let len = lens[block_idx];
+                let addr = *addr;
+                // 地址/长度合法性已在突发级预计算（见 lens），帧内直接读取
                 // 32-bit 字读在总线层面原子（无撕裂）；失败多为瞬态（USB 忙/超时），
                 // 重试一次。**不回退 read_8**：逐字节访问非原子，固件在字节间写入
                 // 会产生撕裂值（真机实测 sin_20hz 坑洼：符号位翻转的假值）。
                 // 重试仍失败 → 本块降级为空（该块目标本帧缺值，其它块不受影响）。
-                if *addr % 4 == 0 && len % 4 == 0 && len > 0 {
+                if addr.is_multiple_of(4) && len.is_multiple_of(4) && len > 0 {
                     let mut words = vec![0u32; len / 4];
-                    let mut ok = core.read_32(*addr, &mut words).is_ok();
+                    let mut ok = core.read_32(addr, &mut words).is_ok();
                     if !ok {
                         SCOPE_READ32_RETRIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         // 冲刺读消耗 DAP 可能残留的队列结果：失败后直接重试，
                         // DAP 会把上一次排队未取走的数据字重复返回
                         let mut dummy = vec![0u32; len / 4];
-                        let _ = core.read_32(*addr, &mut dummy);
-                        ok = core.read_32(*addr, &mut words).is_ok();
+                        let _ = core.read_32(addr, &mut dummy);
+                        ok = core.read_32(addr, &mut words).is_ok();
                     }
                     if ok {
                         let mut buf = Vec::with_capacity(len);
@@ -390,7 +392,7 @@ impl DebugBackend for ProbeRsBackend {
                 // 非 4 对齐块（理论不出现，merge_blocks 按 4 对齐合并）：保留 8-bit
                 let mut buf = vec![0u8; len];
                 if len > 0 {
-                    core.read_8(*addr, &mut buf).map_err(Self::map_err)?;
+                    core.read_8(addr, &mut buf).map_err(Self::map_err)?;
                 }
                 frame.push(buf);
             }

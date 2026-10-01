@@ -525,8 +525,18 @@ impl DebugBackend for OpenOcdBackend {
         // （与 probe-rs 后端一致——旧实现超期后连续快速读取，批内间隔忽快忽慢）
         let mut due = start;
         for _i in 0..count {
-            if Instant::now() < due {
-                std::thread::sleep(due - Instant::now());
+            // 混合节拍（同引擎外层循环）：粗睡到临近 + 末段忙等——
+            // Windows thread::sleep 粒度 ~1-2ms，纯 sleep 无法覆盖亚毫秒间隔
+            // （3kHz=333µs/帧在纯 sleep 下退化为 ~1ms → 只有 ~900Hz）
+            let now = Instant::now();
+            if now < due {
+                let remain = due - now;
+                if remain > Duration::from_millis(2) {
+                    std::thread::sleep(remain - Duration::from_micros(1500));
+                }
+                while Instant::now() < due {
+                    std::hint::spin_loop();
+                }
             }
             // 帧时间戳 = 本帧读取开始时刻（样本窗口起点）。旧实现取全部块读完
             // 后的时刻，回包等待与调度延迟被混进时间戳（真机实测：Agent 时间戳
