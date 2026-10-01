@@ -1541,9 +1541,11 @@ impl Engine {
                 }
             }
         }
+        // 帧数上限 48→512：高频（≥2kHz）时 48 帧（16ms@3kHz）批间开销占比过高
+        // （3kHz 实测仅 ~911Hz），放大突发长度摊薄批间成本；低频不受影响
         let count = (burst_target_us
             .div_ceil(interval.as_micros().max(1) as u64))
-        .clamp(1, 48) as usize;
+        .clamp(1, 512) as usize;
 
         let burst_start = Instant::now();
         let burst_span = interval * count as u32;

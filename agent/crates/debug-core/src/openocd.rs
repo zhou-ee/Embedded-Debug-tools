@@ -593,8 +593,12 @@ impl DebugBackend for OpenOcdBackend {
                 frame.push(bytes);
             }
             out.push((frame_ts, frame));
+            // 节拍推进与重锚定语义同 probe-rs 后端（见彼处注释）
+            due += interval;
             let now = Instant::now();
-            due = if now > due { now + interval } else { due + interval };
+            if now > due {
+                due = now + interval;
+            }
         }
         // 全部块失败也返回实际采样时刻的空帧；引擎计入缺样后再做 50ms 避让。
         if degraded > 0 {

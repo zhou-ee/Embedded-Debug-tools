@@ -395,10 +395,15 @@ impl DebugBackend for ProbeRsBackend {
                 frame.push(buf);
             }
             out.push((frame_ts, frame));
-            // 节拍推进：读取在截止前完成 → 沿用原节拍（间隔严格均匀）；
-            // 超期（读耗时超过间隔）→ 重锚到"当前 + 间隔"，不追赶旧截止
+            // 节拍推进：先按间隔推进截止时刻（周期严格均匀，V1.2.30 的
+            // "读完 now 必然 > due → 每帧重锚" 会使周期变成 间隔+读耗时，
+            // 980Hz 掉到 ~700Hz）；仅当读耗时超过间隔、已落后于推进后的
+            // 截止时才重锚到"当前 + 间隔"（不追赶旧截止，不积累追赶风暴）
+            due += interval;
             let now = Instant::now();
-            due = if now > due { now + interval } else { due + interval };
+            if now > due {
+                due = now + interval;
+            }
         }
         Ok(out)
     }
