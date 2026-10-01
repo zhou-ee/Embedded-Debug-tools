@@ -564,6 +564,8 @@ impl DebugBackend for OpenOcdBackend {
             // 后的时刻，回包等待与调度延迟被混进时间戳（真机实测：Agent 时间戳
             // 间隔与 MCU tick 间隔严重错位 56ms/6ms）
             let frame_ts = start.elapsed();
+            // 帧耗时预算 = 一个采样周期：恢复重试一旦越界立即降级（同 probe-rs 后端）
+            let frame_deadline = Instant::now() + interval;
             let mut frame = Vec::with_capacity(blocks.len());
             for (addr, len) in blocks {
                 total_blocks += 1;
@@ -572,12 +574,14 @@ impl DebugBackend for OpenOcdBackend {
                 if addr % 4 == 0 && len % 4 == 0 && len > 0 {
                     let words = len / 4;
                     // 32-bit 字读在总线层面原子（无撕裂）；带内失败多为瞬态
-                    // （目标忙/GDB 抢占/复位过渡），重试一次。
+                    // （目标忙/GDB 抢占/复位过渡），重试一次（帧预算内）。
                     // **不回退 read_memory 8**：逐字节访问非原子，固件在字节间写入
                     // 会产生撕裂值（真机实测 sin_20hz 坑洼：符号位翻转的假值）。
                     let mut ok = false;
                     let mut resp = String::new();
-                    for _ in 0..2 {
+                    let mut attempts = 0usize;
+                    loop {
+                        attempts += 1;
                         if let Ok(r) = self.tcl(&format!("read_memory 0x{addr:x} 32 {words}")) {
                             let lower = r.to_lowercase();
                             let bad = lower.contains("error") || lower.contains("failed")
@@ -598,6 +602,10 @@ impl DebugBackend for OpenOcdBackend {
                             return Err(BackendError::ConnectionLost(
                                 "Tcl 传输失败（连接将重建）".into(),
                             ));
+                        }
+                        // 重试上界：最多 2 次，且不得越帧预算 → 越界即降级为空
+                        if attempts >= 2 || Instant::now() >= frame_deadline {
+                            break;
                         }
                     }
                     if !ok {
@@ -644,11 +652,14 @@ impl DebugBackend for OpenOcdBackend {
                 watch_out.push(wblocks);
             }
             self.watch_frame_counter += 1;
-            // 节拍推进与重锚定语义同 probe-rs 后端（见彼处注释）
+            // 节拍推进：沿 burst 起点固定时间轴推进到下一个未来网格截止，
+            // 迟到时跳过已失拍网格点（语义同 probe-rs 后端，见彼处注释）
             due += interval;
             let now = Instant::now();
             if now > due {
-                due = now + interval;
+                let late_steps =
+                    ((now - due).as_nanos() / interval.as_nanos().max(1) + 1) as u32;
+                due += interval * late_steps;
             }
         }
         // 全部块失败也返回实际采样时刻的空帧；引擎计入缺样后再做 50ms 避让。

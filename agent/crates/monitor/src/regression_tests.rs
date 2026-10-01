@@ -331,6 +331,23 @@ fn fail_backoff_escalates_and_caps_at_50ms() {
 }
 
 #[test]
+fn drain_commands_budget_caps_per_round_and_reports_pending() {
+    let (cmd_tx, cmd_rx) = unbounded();
+    let (event_tx, _events) = unbounded();
+    let mut eng = Engine::new(cmd_rx, event_tx);
+    for _ in 0..40 {
+        cmd_tx.send(Command::SetSymbolRefs(Vec::new())).unwrap();
+    }
+    // 首轮预算（32 条）耗尽 → 报告仍有积压；次轮消费剩余 8 条 → 队列已空
+    assert!(eng.drain_commands(), "首轮预算耗尽应返回 true（仍有积压）");
+    assert!(!eng.drain_commands(), "次轮消费剩余后应返回 false（队列空）");
+    assert!(
+        !eng.shutdown,
+        "命令应被真实消费（SetSymbolRefs 已生效）且不触发关机"
+    );
+}
+
+#[test]
 fn watch_interleave_emits_latest_watch_data_and_sets_flag() {
     let (mut engine, state, events) = engine(true);
     engine.handle_command(Command::UpdateScopeTargets(vec![ScopeTarget {

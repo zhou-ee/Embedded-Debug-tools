@@ -114,21 +114,23 @@ r = cli.call("elf_load", {"path": ELF}, timeout=60)
 check("elf_load", r.get("ok") and r["result"]["variableCount"] > 0,
       f"vars={r.get('result', {}).get('variableCount')}")
 
-# 重新解析三通道地址（不硬编码历史地址）
+# 重新解析三通道地址（不硬编码历史地址）。真三路正弦 sin_1hz/sin_5hz/
+# sin_20hz 地址连续（0x94/0x98/0x9c），合并为单个 12B 读块——与界面实际
+# 配置一致（2026-10-02 复测指正：旧脚本用 chassis 指针会拆成两个读块，
+# 其 3kHz 结论不能代表界面三路能力）
 addrs = {}
-for expr in ("sin_1hz", "sin_20hz", "g_chassis_ctx_ptr"):
+for expr in ("sin_1hz", "sin_5hz", "sin_20hz"):
     r = cli.call("elf_resolve", {"expr": expr}, timeout=15)
     node = r.get("result") or {}
     if node.get("address"):
         addrs[expr] = (node["address"], min(node.get("size") or 4, 64))
 check("符号解析", len(addrs) >= 2, addrs)
 
-sin1 = addrs.get("sin_1hz", (0x20000094, 4))
-sin20 = addrs.get("sin_20hz", (0x2000009c, 4))
-scope_targets = [{"addr": sin1[0], "size": 4}, {"addr": sin20[0], "size": 4}]
-if "g_chassis_ctx_ptr" in addrs:
-    a, s = addrs["g_chassis_ctx_ptr"]
-    scope_targets.append({"addr": a, "size": min(s, 64)})
+scope_targets = [
+    {"addr": a, "size": 4}
+    for a, _s in (addrs.get(e) for e in ("sin_1hz", "sin_5hz", "sin_20hz"))
+    if a
+]
 
 perf0 = cli.call("scope_perf")
 
@@ -143,7 +145,7 @@ check("1kHz >3周期空档 ≤12/12s", s1.get("over3", 99) <= 12, f"over3={s1.ge
 print(f"   1kHz 无 watch 基线: {s1}")
 
 # ── 场景 2：1kHz + 15Hz watch 插帧 ──
-cli.call("set_watch_targets", {"targets": [{"id": "live_val", "addr": sin1[0], "size": 4, "autoRefresh": True}]})
+cli.call("set_watch_targets", {"targets": [{"id": "live_val", "addr": addrs["sin_1hz"][0], "size": 4, "autoRefresh": True}]})
 cli.call("set_watch_freq", {"freq": 15.0})
 time.sleep(1.0)
 cli.take_events()

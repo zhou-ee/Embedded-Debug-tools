@@ -382,33 +382,44 @@ impl DebugBackend for ProbeRsBackend {
             }
             // 帧时间戳 = 本帧读取开始时刻（样本窗口起点）。旧实现取全部块读完
             // 后的时刻，回包等待与调度延迟被混进时间戳（真机实测：Agent 时间戳
-            // 间隔与 MCU tick 间隔严重错位 56ms/6ms）
+            // 间隔与 MCU tick 间隔严重错位 56ms/6ms）。注意：USB 同步收发可被
+            // 阻塞数十 ms（2026-10-02 复测：单次 DAP_Transfer 发送 16ms），
+            // 真实采样时刻落在 [frame_ts, frame_ts+读取耗时] 区间内。
             let frame_ts = start.elapsed();
+            // 帧耗时预算 = 一个采样周期：从帧起点算起，恢复动作（冲刺读/重试/
+            // 逐字读）一旦越界立即放弃降级——慢恢复只会把下一帧顶得更迟
+            let frame_deadline = Instant::now() + interval;
             let mut frame = Vec::with_capacity(blocks.len());
             for (block_idx, (addr, _len)) in blocks.iter().enumerate() {
                 let len = lens[block_idx];
                 let addr = *addr;
                 // 地址/长度合法性已在突发级预计算（见 lens），帧内直接读取。
-                // 帧耗时预算：读耗时超过间隔时不再重试，降级本块为空。
                 // 32-bit 字读在总线层面原子（无撕裂）。
                 if addr.is_multiple_of(4) && len.is_multiple_of(4) && len > 0 {
                     let mut words = vec![0u32; len / 4];
                     let mut ok = core.read_32(addr, &mut words).is_ok();
-                    if !ok {
+                    if !ok && Instant::now() < frame_deadline {
                         // 冲刺读消耗 DAP 可能残留的队列结果，再重试一次
+                        SCOPE_READ32_RETRIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         let mut dummy = vec![0u32; len / 4];
                         let _ = core.read_32(addr, &mut dummy);
                         ok = core.read_32(addr, &mut words).is_ok();
-                        if !ok && len > 4 {
+                        if !ok && len > 4 && Instant::now() < frame_deadline {
                             // 大块读失败 → 降为逐字读（探测 CMSIS-DAP 固件对
-                            // BlockTransfer 的大小限制），成功部分拼回
+                            // BlockTransfer 的大小限制）。**全有或全无**：失败
+                            // 批读可能在 words 留下部分/零值，任何一字失败都
+                            // 不能把残缺数据当有效值下发 → 整块记空（缺样）
+                            words.iter_mut().for_each(|w| *w = 0);
+                            let mut failed = false;
                             for (w_idx, slot) in words.iter_mut().enumerate() {
                                 let mut w1 = [0u32; 1];
                                 if core.read_32(addr + (w_idx * 4) as u64, &mut w1).is_ok() {
                                     *slot = w1[0];
+                                } else {
+                                    failed = true;
                                 }
                             }
-                            ok = true;
+                            ok = !failed;
                         }
                     }
                     if ok {
@@ -432,7 +443,7 @@ impl DebugBackend for ProbeRsBackend {
             }
             out.push((frame_ts, frame));
             // 监视读插帧：全局帧计数到达监视节拍时，在帧间节拍窗读监视块
-            // （读耗时由超期重锚定自然吸收）；失败丢该次监视值（空字节 → 前端缺样）
+            // （读耗时由网格重锚定自然吸收）；失败丢该次监视值（空字节 → 前端缺样）
             if watch_every > 0 && (watch_frame_counter + 1).is_multiple_of(watch_every as u64) {
                 let mut wblocks = Vec::with_capacity(watch_blocks.len());
                 for (waddr, wlen) in watch_blocks {
@@ -461,12 +472,16 @@ impl DebugBackend for ProbeRsBackend {
                 watch_out.push(wblocks);
             }
             watch_frame_counter += 1;
-            // 节拍推进：先按间隔推进截止（周期严格均匀）；仅当读耗时超过间隔、
-            // 已落后于推进后的截止时才重锚（不追赶旧截止，不积累追赶风暴）
+            // 节拍推进：沿 burst 起点固定时间轴推进到下一个未来网格截止。
+            // 读取迟到时跳过已失拍的网格点（不追赶连读，附加等待 =
+            // 距下一网格点 ≤ interval；旧实现再等一整拍且相位漂移——真机
+            // 实测 20.4ms 慢读后点间隔被拉到 21.4ms 且偏离原节拍网格）
             due += interval;
             let now = Instant::now();
             if now > due {
-                due = now + interval;
+                let late_steps =
+                    ((now - due).as_nanos() / interval.as_nanos().max(1) + 1) as u32;
+                due += interval * late_steps;
             }
         }
         (out, watch_out, watch_frame_counter)

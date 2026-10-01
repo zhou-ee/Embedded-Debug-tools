@@ -229,6 +229,8 @@ pub const DEFAULT_WATCH_FREQ: f64 = 5.0;
 #[allow(dead_code)]
 pub const WATCH_INTERVAL: Duration = Duration::from_millis(200); // 5 Hz (默认)
 const STATE_POLL_INTERVAL: Duration = Duration::from_millis(150);
+/// 示波激活期的状态轮询间隔：降频减少 DAP 争抢（见主循环注释）
+const SCOPE_ACTIVE_POLL_INTERVAL: Duration = Duration::from_millis(600);
 const SCOPE_BATCH_INTERVAL: Duration = Duration::from_millis(33);
 const RECONNECT_INTERVAL: Duration = Duration::from_secs(1);
 /// 栈读取门槛（对照原版 sp > 0x10000000）
@@ -417,10 +419,18 @@ impl Engine {
                     self.sample_watch();
                 }
 
-                // 2. 状态轮询（10Hz）：及时探测目标 halt/running 与断点命中
+                // 2. 状态轮询：示波激活时降频到 600ms——DHCSR/PPB 访问与采样
+                //    争抢同一 DAP，真机实测 150ms 轮询场景空档 125 个/30s vs
+                //    关闭 19 个（2026-10-02 复测）。halt 边沿：RPC Halt/Resume
+                //    命令后立即 poll 兜底，调试会话另有 set_poll_suppression
+                //    完全挂起；代价是观察点命中检测延迟至多 600ms
                 let now = Instant::now();
                 if now >= self.next_state_poll {
-                    self.next_state_poll = now + STATE_POLL_INTERVAL;
+                    self.next_state_poll = now + if scope_active {
+                        SCOPE_ACTIVE_POLL_INTERVAL
+                    } else {
+                        STATE_POLL_INTERVAL
+                    };
                     if !self.poll_suppressed {
                         self.poll_state();
                     }
@@ -443,7 +453,13 @@ impl Engine {
                 track(self.next_scope, scope_active, &mut next_due);
                 track(self.next_scope_flush, scope_flush_active, &mut next_due);
                 track(self.next_state_poll, true, &mut next_due);
-                track(self.next_watch, !self.watch_targets.is_empty(), &mut next_due);
+                // 插帧激活时 next_watch 不再推进（监视读在突发内完成），
+                // 不纳入调度——否则过期截止让 next_due 永远在过去，
+                // 主循环等待分支整体失效 → 满速空转（2026-10-02 复测实锤：
+                // 48s 烧穿 40 万条事件缓冲）
+                track(self.next_watch,
+                    !self.watch_targets.is_empty() && !self.watch_interleave_active,
+                    &mut next_due);
             }
 
             // 4. 自适应等待：粗睡到临近，活跃采样（示波或变量监视）忙等收尾保证采样精度
@@ -466,8 +482,11 @@ impl Engine {
                         if remain > Duration::from_micros(2500) {
                             std::thread::sleep(remain - Duration::from_micros(1800));
                         } else if active_sampling || commands_pending {
-                            // 活跃采样或有命令积压：末段忙等到点，杜绝 Windows 毫秒睡眠超期
-                            while Instant::now() < due && !self.shutdown {
+                            // 忙等到**截断后的截止**（now + remain），不是原始 due——
+                            // 旧实现 remain 被截到 2ms 却忙等到 due，命令积压时
+                            // 一次空转可达整个等待窗（100ms）
+                            let deadline = now + remain;
+                            while Instant::now() < deadline && !self.shutdown {
                                 std::hint::spin_loop();
                             }
                         } else {
@@ -516,17 +535,24 @@ impl Engine {
         }
     }
 
-    /// 每轮命令处理预算：ReadMemSync 等阻塞命令单条可达 2s，无预算时示波激活期
-    /// 的命令洪峰会把采样节拍整体顶空。预算内没处理完的留在队列，返回 true 让
-    /// 主循环不睡眠立即再来一轮（命令与采样交错推进，而非命令独占线程）。
+    /// 每轮命令处理预算：32 条**且** 8ms 墙钟（先到者生效）——命令计数挡不住
+    /// 慢调用（ReadMemSync 单条最长 2s），墙钟预算在命令间隙让路给到期采样；
+    /// 单条慢调用本身无法中断（同一探针访问必须串行）。预算内没处理完的留在
+    /// 队列，返回 true 让主循环把等待上限压到 2ms 立即再来一轮（命令与采样
+    /// 交错推进，而非命令独占线程）。
     fn drain_commands(&mut self) -> bool {
         const COMMAND_BUDGET: usize = 32;
+        const COMMAND_WALL_BUDGET: Duration = Duration::from_millis(8);
+        let round_start = Instant::now();
         let mut processed = 0usize;
         while processed < COMMAND_BUDGET {
             match self.cmd_rx.try_recv() {
                 Ok(cmd) => {
                     self.handle_command(cmd);
                     processed += 1;
+                    if round_start.elapsed() >= COMMAND_WALL_BUDGET {
+                        return true;
+                    }
                 }
                 Err(TryRecvError::Empty) => return false,
                 Err(TryRecvError::Disconnected) => {
