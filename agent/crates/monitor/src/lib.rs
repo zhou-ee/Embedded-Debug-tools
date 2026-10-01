@@ -400,7 +400,16 @@ impl Engine {
                 // 2. 状态轮询（10Hz）：及时探测目标 halt/running 与断点命中
                 let now = Instant::now();
                 if now >= self.next_state_poll {
-                    self.next_state_poll = now + STATE_POLL_INTERVAL;
+                    // 示波激活时状态轮询降频（150→600ms）：poll 的 PPB/DHCSR
+                    // 读取落在帧间会造成 1-3ms 级空档（1kHz 下 >3ms 即标记空档，
+                    // 真机实测 ~每 350ms 一次与轮询周期吻合）。调试器引发的停机
+                    // 由插件的调试会话监听即时感知，不依赖此轮询。
+                    let poll_interval = if scope_active {
+                        Duration::from_millis(600)
+                    } else {
+                        STATE_POLL_INTERVAL
+                    };
+                    self.next_state_poll = now + poll_interval;
                     self.poll_state();
                 }
 
